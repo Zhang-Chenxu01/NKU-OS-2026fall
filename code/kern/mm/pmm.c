@@ -62,6 +62,81 @@ size_t nr_free_pages(void) {
 }
 
 //lab2 function1 YOUR CODE
+static void page_init(void) {
+    extern char end[];
+    uint64_t mem_base = get_memory_base();
+    uint64_t mem_size = get_memory_size();
+    const uintptr_t addr_max = (uintptr_t)-1;
+
+    /* nbase and the boot mapping require RAM to start at DRAM_BASE. */
+    if (mem_base != DRAM_BASE || mem_size == 0 ||
+        mem_size > addr_max - mem_base) {
+        panic("page_init: invalid DTB memory base/size");
+    }
+    uintptr_t mem_end = mem_base + mem_size;
+    if (mem_end > PHYSICAL_MEMORY_END || mem_end <= mem_base) {
+        panic("page_init: DTB memory exceeds the supported physical range");
+    }
+
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+    uintptr_t kernel_pa = PADDR(KERNBASE);
+    uintptr_t end_va = (uintptr_t)end;
+    uintptr_t usable_end = ROUNDDOWN(mem_end, PGSIZE);
+    if (kernel_pa < mem_base || kernel_pa >= usable_end ||
+        end_va < KERNBASE || end_va > addr_max - (PGSIZE - 1)) {
+        panic("page_init: invalid kernel address layout");
+    }
+    uintptr_t end_pa = PADDR(end_va);
+    if (end_pa < kernel_pa || end_pa >= usable_end) {
+        panic("page_init: physical memory cannot contain the kernel");
+    }
+
+    /* npage is an exclusive physical page number, not a page count. */
+    npage = PPN(usable_end);
+    if (npage <= nbase) {
+        panic("page_init: no manageable physical pages");
+    }
+    size_t count = npage - nbase;
+    if (count > (size_t)-1 / sizeof(struct Page)) {
+        panic("page_init: Page array size overflow");
+    }
+    size_t descriptors_size = count * sizeof(struct Page);
+    uintptr_t pages_va = ROUNDUP(end_va, PGSIZE);
+    uintptr_t pages_pa = PADDR(pages_va);
+    if (pages_pa >= usable_end ||
+        descriptors_size > addr_max - pages_va ||
+        descriptors_size > addr_max - pages_pa) {
+        panic("page_init: Page array address overflow or no metadata space");
+    }
+    uintptr_t descriptors_end = pages_pa + descriptors_size;
+    if (descriptors_end > usable_end ||
+        descriptors_end > addr_max - (PGSIZE - 1)) {
+        panic("page_init: physical memory cannot contain the Page array");
+    }
+    uintptr_t free_pa = ROUNDUP(descriptors_end, PGSIZE);
+    if (free_pa >= usable_end) {
+        panic("page_init: no complete free page after the Page array");
+    }
+
+    /* Keep firmware, kernel, metadata and alignment gaps reserved. */
+    pages = (struct Page *)pages_va;
+    memset(pages, 0, descriptors_size);
+    for (size_t i = 0; i < count; i++) {
+        SetPageReserved(&pages[i]);
+        list_init(&pages[i].page_link);
+    }
+
+    size_t free_count = (usable_end - free_pa) >> PGSHIFT;
+    init_memmap(pa2page(free_pa), free_count);
+
+    cprintf("physical memory: [0x%016lx, 0x%016lx)\n", mem_base, mem_end);
+    cprintf("page_init: offset=0x%016lx, nbase=%lu, npage=%lu\n",
+            va_pa_offset, nbase, npage);
+    cprintf("Page array: VA 0x%016lx, PA [0x%016lx, 0x%016lx), %lu pages\n",
+            pages_va, pages_pa, descriptors_end, count);
+    cprintf("free memory: PA [0x%016lx, 0x%016lx), %lu pages\n",
+            free_pa, usable_end, free_count);
+}
 
 /* pmm_init - initialize the physical memory management */
 void pmm_init(void) {
