@@ -5,6 +5,11 @@
 #include <string.h>
 #include <dtb.h>
 
+#ifdef SLUB_SELFTEST
+#include <slub.h>
+void slub_selftest(void);
+#endif
+
 int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
 void print_kerninfo(void);
@@ -38,6 +43,11 @@ int kern_init(void) {
 
     // grade_backtrace();
     pmm_init();  // init physical memory management
+
+#ifdef SLUB_SELFTEST
+    slub_init();
+    slub_selftest();
+#endif
 
     /* do nothing */
     while (1)
