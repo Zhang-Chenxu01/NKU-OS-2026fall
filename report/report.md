@@ -1126,11 +1126,9 @@ void slub_selftest(void);
 
 ## 五、测试与验证
 
-<!-- 根据该实验的具体情况，提供完整的测试运行截图，应包含：
+课程自动评分截图显示总分为 **20/20**，其中 `check page init` 和 `check best fit` 均为 `OK`。
 
-- 编译及运行成功的输出（make qemu），可能有多个
-- 测试通过的结果（make grade），只有一个
-  -->
+![图5-1 Lab2课程自动评分结果（20/20）](./images/lab2_grade.png)
 
 ### 5.1 成员二：Best-Fit 开发与复查阶段的验证记录
 
@@ -1172,6 +1170,8 @@ grading: 6 / 6 points
 check_alloc_page() succeeded!
 ```
 
+![图5-2 Best-Fit物理内存分配器自检结果（6/6）](./images/best_fit_test.png)
+
 `make test` 对内核定义 `ucore_test`，启用 `best_fit_check()` 中的分项计分输出。`check_alloc_page()` 通过管理器函数指针调用原有检查，`best_fit_check()` 又调用 `basic_check()`，因此该成功信息来自实际断言完成后的控制流，而不是额外打印的替代结果。
 
 | 原有测试阶段 | 检查内容 |
@@ -1185,7 +1185,7 @@ check_alloc_page() succeeded!
 
 两次运行均在观察到检查成功及后续页表地址输出后，以 QEMU 控制台的 `Ctrl-a x` 正常退出。内核正常检查后停留在空循环，不以等待超时本身作为通过依据。
 
-这里的 **6/6 是 `make test` 下 Best-Fit 自检的分数，不是 `make grade` 的结果**。上述开发与复查没有执行 `make grade`，因此不能据此宣称课程综合评分全部通过。First-Fit 本节以参考源码分析为主，也没有把 Best-Fit 的运行输出写成独立运行 First-Fit 的测试证据。本轮不新增截图。
+这里的 **6/6 是 `make test` 下 Best-Fit 自检的分数，不是 `make grade` 的结果**。上述开发与复查没有执行 `make grade`，因此不能据此宣称课程综合评分全部通过。First-Fit 本节以参考源码分析为主，也没有把 Best-Fit 的运行输出写成独立运行 First-Fit 的测试证据。
 
 ### 5.2 成员二：SLUB 自检与默认 Best-Fit 回归
 
@@ -1214,6 +1214,8 @@ check_alloc_page() succeeded!
 [SLUB] ALL TESTS PASS
 ```
 
+![图5-3 SLUB对象分配器功能与页面回收测试](./images/slub_test.png)
+
 测试通过公开接口观察行为，没有读取或改写 SLUB 的内部页头，也没有删除课程组断言。覆盖情况如下：
 
 | 测试函数 | 验证方法 |
@@ -1241,11 +1243,7 @@ memory management: best_fit_pmm_manager
 check_alloc_page() succeeded!
 ```
 
-普通运行没有输出 SLUB 自检信息，验证宏关闭后不会进入测试入口。该镜像初始空闲页数为 31929，而自检镜像为 31928，来自不同构建的内核占用差异；是否发生页面泄漏，应比较同一自检镜像运行前后的值，本次为 `31928 -> 31928`。两次 QEMU 均在观察到检查完成后使用 `Ctrl-a x` 正常退出，没有将超时作为成功依据。本节未新增截图。
-
-**测试截图：**
-
-![测试结果截图](E:\download\wechatfiles\xwechat_files\wxid_z28x9rr9nt7522_837b\msg\file\2026-09\images\test_result.png)
+普通运行没有输出 SLUB 自检信息，验证宏关闭后不会进入测试入口。该镜像初始空闲页数为 31929，而自检镜像为 31928，来自不同构建的内核占用差异；是否发生页面泄漏，应比较同一自检镜像运行前后的值，本次为 `31928 -> 31928`。两次 QEMU 均在观察到检查完成后使用 `Ctrl-a x` 正常退出，没有将超时作为成功依据。
 
 ---
 
