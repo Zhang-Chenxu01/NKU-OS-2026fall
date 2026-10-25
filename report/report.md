@@ -857,7 +857,469 @@ Requirements：
 
 **负责人：** 2413042-郭桦
 
-待成员三补充模块说明、关键接口、实际使用的 Prompt、实现迭代及测试记录。本节不代写其开发过程或测试结论。
+##### （1）模块功能描述
+
+Buddy System 是 `struct pmm_manager` 的又一个实现，代码位于 `code/kern/mm/buddy_pmm.c` 和 `buddy_pmm.h`，通过 `code/kern/mm/pmm.c` 中的 `USE_BUDDY_PMM` 编译开关选择。未定义该宏时，`init_pmm_manager()` 仍选择 `best_fit_pmm_manager`，因此 Buddy 是可选策略，不改变默认评测路径。
+
+与 First-Fit、Best-Fit 按地址维护一条空闲链表不同，Buddy 按 2 的幂次（order）维护一组空闲链表。order 为 `o` 的块包含 `2^o` 个连续物理页；本实现取 `BUDDY_MAX_ORDER = 10`，即单块最大 4 MiB。请求页数先向上取整到 order，分配时从更大的块逐级拆半，释放时只与同 order 的伙伴合并。这样，块的大小和地址对齐都由 order 决定，查找时不需要比较块长度。
+
+模块向框架提供与其他管理器相同的六个接口：
+
+| 接口 | 职责 |
+|---|---|
+| `buddy_init()` | 初始化 11 条 order 链表和两个计数器 |
+| `buddy_init_memmap(struct Page *base, size_t n)` | 把 `page_init()` 交来的连续空闲页切块登记 |
+| `buddy_alloc_pages(size_t n)` | 取最小的可用高阶块，拆分后返回 `2^ceil(log2 n)` 页 |
+| `buddy_free_pages(struct Page *base, size_t n)` | 按原始 order 归还并向上合并伙伴 |
+| `buddy_nr_free_pages()` | 返回空闲页总数 |
+| `buddy_check()` | 运行模块内测试，仅在 `USE_BUDDY_PMM` 下由 `check_alloc_page()` 调用 |
+
+`page_init()` 只在最后调用 `init_memmap(free_pa, free_count)`，不区分具体管理器。Buddy 的登记函数不假设 `free_pa` 按大块对齐，也不假设 `free_count` 是 2 的幂；这一点在真实内核中尤其重要，因为空闲区的起点由内核镜像和 `pages` 数组末端共同决定。
+
+##### （2）核心数据结构
+
+Buddy 的管理状态只有两个静态对象：
+
+```c
+static free_area_t buddy_free_area[BUDDY_NR_ORDERS];  /* order 0..10 */
+static size_t      buddy_nr_free;                     /* 空闲页总数 */
+```
+
+`free_area_t` 沿用 `memlayout.h` 中的定义，`free_list` 是同 order 的空闲块链表，`nr_free` 是该 order 的块数。`Page` 描述符中的字段在 Buddy 下含义如下：
+
+| 字段或宏 | 在 Buddy 中的含义 |
+|---|---|
+| `property` | 空闲块头所在块的 order；`property=o` 表示块大小为 `2^o` 页 |
+| `PG_property` | 空闲块头标志；只有块头置位，块内其余页不置位 |
+| `page_link` | 块头的链表节点，挂在 `buddy_free_area[order].free_list` |
+| `ref` | 页引用计数；登记和释放时清零 |
+| `flags` 的 `PG_reserved` | 页面保留位；`page_init()` 交来的页先为 Reserved，登记时清除 |
+
+这里与 Best-Fit 有一个容易混淆的差异：Best-Fit 的 `property` 记录块包含的页数，而 Buddy 的 `property` 记录 order，块页数需要按 `2^order` 换算。`buddy_free_area[o].nr_free` 同样是块数而不是页数；页数总和由 `buddy_nr_free` 单独维护。任何时刻都应满足：
+
+```text
+Σ (buddy_free_area[o].nr_free × 2^o) == buddy_nr_free
+```
+
+每个空闲块只把块头页挂链，块内其余页保持 `PG_property=0`。因此，遍历链表看到的是块头，而不是所有空闲页。
+
+##### （3）核心算法分析
+
+**初始化：最大对齐切分。** `buddy_init_memmap()` 先逐页断言原状态为 Reserved，清零 `flags`、`property` 和引用计数；随后从起始绝对页号 `pfn` 开始，每轮选择最大的 order，使 `pfn` 按 `2^order` 对齐且 `pfn + 2^order` 不越过区间末尾。选定后把该块头挂入对应链表，`pfn += 2^order`，直到覆盖整个区间。这样既不要求起点对齐，也不要求页数是 2 的幂。
+
+在真实内核中，`page_init()` 登记的空闲区是 `[0x80348, 0x88000)`，共 31928 页。起点只按 8 页对齐，因此切分结果为：
+
+```text
+order 3  × 1     8 页
+order 4  × 1    16 页
+order 5  × 1    32 页
+order 7  × 1   128 页
+order 10 × 31 31744 页
+合计           31928 页
+```
+
+到 `0x80400` 之后，起点已经按 1024 页对齐，剩余空间正好切成 31 个 order 10 块。这说明初始化不是“整段当成一个大块”，而是按当前对齐程度逐步放大块。
+
+**分配：向上取整与逐级拆分。** `buddy_alloc_pages(n)` 先把 `n` 向上取整为最小的 order，使 `2^order >= n`；然后从该 order 扫描到 `BUDDY_MAX_ORDER`，取第一条非空链表的第一个块。摘链后清除块头标志、把 `property` 置 0，并从原 order 逐级拆到目标 order：每拆一级，把后半块作为新块头挂入低一级链表，前半块继续保留。最后返回前半块，`buddy_nr_free` 只减去目标 order 的页数。
+
+例如，独立裸机测试中从 order 9 的 512 页块分配 1 页时，会依次拆出 order 8、7、…、0 的后半块，返回最低的 1 页；`buddy_nr_free` 只减少 1。在真实内核中最小非空 order 为 3，因此同一操作从 order 3 拆到 order 0。拆分本身不改变空闲页总数，只改变块的组织形式。
+
+**释放：按伙伴关系合并。** `buddy_free_pages(base, n)` 把 `n` 向上取整为 order，先按原始 order 把 `buddy_nr_free` 增加一次，然后循环尝试合并。伙伴页号由下式得到：
+
+```c
+uintptr_t buddy_pfn = pfn ^ (1UL << order);
+```
+
+只有伙伴页号在 `[nbase, npage)` 内、伙伴是空闲块头、且伙伴的 `property` 等于当前 order 时才合并。合并时把伙伴从链表摘除、清除块头标志、对应 order 块数减一，块头更新为 `pfn & buddy_pfn`（较小页号），order 加一后继续。伙伴不满足任一条件就停止，把最终块挂回对应链表。合并到 `BUDDY_MAX_ORDER` 时不再向上，因为更高 order 没有链表。
+
+**不变量与复杂度。** 实现和测试共同维护以下不变量：order 为 `o` 的块起始 pfn 按 `2^o` 对齐且整体在 `[nbase, npage)` 内；每个空闲块只出现在一条链表上；只有同 order 且空闲的伙伴才能合并；块头标志与 `property` 一致；空闲页总数等于各 order 块页数之和；分配返回的块头不带 `PG_property`。
+
+分配最多扫描 11 条链表、拆分最多 10 次；释放最多合并 10 次；单次操作的开销只与 order 上界有关，与空闲页总数无关。初始化与页数和切出的块数线性相关。管理状态本身只占 11 个链表头和两个计数器，不需要额外分配内存。
+
+按实验要求，实现只保留 Linux buddy 的按阶组织和伙伴拆分/合并语义，没有引入 zone、迁移类型、per-CPU pageset、watermark、compaction、OOM、pageblock、memory hotplug 和多核锁。`BUDDY_MAX_ORDER=10` 是覆盖 4 MiB 连续块与限制拆分层数之间的折中。
+
+##### （4）Prompt 记录
+
+以下按实际协作顺序记录 6 份 Prompt。为使每轮都符合四段式，对话内容做了结构化归纳，步骤和结论与实际过程一致。每份 Prompt 都以 `[PROMPT]` 开头，依次给出 `[RELY]`、`[GUARANTEE]`、`[SPECIFICATION]`；块与块之间只保留步骤标题，下一块用“基于上一轮……”承接，不插入 AI 回复。最终测试结果见 5.3 节。
+
+**第 1 块：确认需求与阅读框架**
+
+````markdown
+[PROMPT]
+
+任务：在 riscv64-ucore lab2 框架上独立设计、实现并测试 Buddy System 物理内存分配器。先阅读空框架代码，梳理可复用接口、依赖文件、缺失项和可修改范围；本轮不写代码。
+
+操作要求：
+- 先读真实代码再回答，不要凭记忆补全工程里不存在的接口。
+- 只做阅读和梳理，不修改任何文件。
+- 发现依赖缺失（如 page_init() 未实现）时直接指出，不要自行补写。
+
+输出要求：
+- 给出依赖文件清单、可复用接口、缺失项、可修改范围。
+- 使用工程中的真实符号名，不使用近似名。
+
+[RELY]
+
+框架路径：C:\Users\milkw\Desktop\操作系统作业\lab2_2\lab2_new
+
+重点阅读：
+- kern/mm/pmm.c、pmm.h：struct pmm_manager 六个接口、init_pmm_manager()、page_init() 的现状。
+- kern/mm/memlayout.h：struct Page、free_area_t、PageProperty/SetPageProperty/ClearPageProperty。
+- kern/mm/mmu.h：PGSIZE、PGSHIFT、PPN。
+- libs/list.h：list_init、list_add、list_del、list_empty、list_next、le2page。
+- libs/defs.h：size_t、uintptr_t、bool、NULL。
+- kern/mm/default_pmm.c：First-Fit 的写法，作为接口约定参考。
+- Makefile：源文件收集方式和编译选项。
+- tools/：测试、评分和注入脚本，只读，不修改。
+
+已知约束：
+- 不允许修改 pmm.h、memlayout.h、mmu.h、libs/*、Makefile、tools/*。
+- 最终默认 manager 必须是 best_fit_pmm_manager，Buddy 只能通过编译开关临时选中。
+- page_init() 和 best_fit_pmm.c 可能尚未完成，不要补它们。
+
+[GUARANTEE]
+
+本轮交付一份“框架依赖与接口清单”，至少包含：
+- 可复用的宏、结构体、函数及其真实签名/字段。
+- struct pmm_manager 六个成员的确切签名。
+- page_init() 是否已实现、best_fit_pmm_manager 是否已定义。
+- 允许新增/修改的文件，以及其他成员负责、不能改的文件。
+
+[SPECIFICATION]
+
+清单需要逐项说明：
+- struct Page 的字段用途，尤其是 ref、flags、property、page_link。
+- free_area_t 的 free_list 和 nr_free 的计数含义。
+- page2ppn/page2pa/pa2page 的转换关系，以及 nbase/npage 的含义。
+- list_add(listelm, elm) 的插入语义。
+- page_init() 未实现时，完整内核是否还能链接；如果不能，给出替代验证路径。
+- 编译选项是否包含 -Werror、-nostdinc 等约束。
+````
+
+**第 2 块：选择参考设计并解读 Linux**
+
+````markdown
+[PROMPT]
+
+任务：基于上一轮给出的框架清单，调研可参考的物理内存分配器设计，重点分析 Linux Buddy System；说明哪些设计可以移植到 ucore，哪些必须裁掉，并给出选择 Linux 方案的理由。
+
+操作要求：
+- 先比较候选方案，再给出结论；不要直接假定 Linux 方案。
+- 只解释设计，不写代码、不修改文件。
+- 所有设计点都要对应到上一轮的框架约束。
+
+输出要求：
+- 一份方案对比与选择理由。
+- 一份 Linux Buddy 的核心结构、初始化、分配、释放和不变量说明。
+
+[RELY]
+
+上一轮已确认：
+- struct pmm_manager 六接口；struct Page 含 ref/flags/property/page_link；free_area_t 含 free_list/nr_free。
+- ucore 没有 zone、迁移类型、per-CPU pageset 等概念。
+- 页面描述符由 pages 数组管理，页号范围 [nbase, npage)。
+
+可参考的设计方向：
+- 连续空闲链表（First-Fit/Best-Fit）。
+- 按 2 的幂次组织的 Buddy System。
+- 分级/索引结构。
+Linux 参考点：free_area[order]、PageBuddy/PagePrivate 的语义、page->private、buddy_list、__free_one_page、expand、rmqueue 的拆分逻辑。
+
+[GUARANTEE]
+
+必须给出：
+- 候选方案对比（至少 First-Fit、Best-Fit、Buddy）。
+- 选择 Linux Buddy 作为参考的理由。
+- Linux 侧关键结构/函数与 ucore 的对应关系。
+- 明确列出不移植的 Linux 特性（zone、迁移类型、watermark、compaction、OOM、per-CPU pageset、pageblock、memory hotplug、多核锁）。
+
+[SPECIFICATION]
+
+对比维度至少覆盖：
+- 空闲块组织方式（地址有序链表 vs 按阶链表）。
+- 分配查找复杂度、拆分方式、释放合并条件。
+- 内部碎片/外部碎片的来源。
+- 与现有 pmm_manager 六接口的契合度。
+- 在 ucore 上实现所需的数据结构和改动范围。
+
+Linux 设计说明至少覆盖：
+- order 与 free_area[order] 的含义。
+- PageBuddy(page)、page->private、buddy_list 的对应关系。
+- 初始化时如何把连续区间切成最大对齐块。
+- 分配时如何向上取整、找块、逐级拆半。
+- 释放时如何用伙伴页号合并、同 order 条件、边界检查。
+- 必须保持的不变量。
+````
+
+**第 3 块：确认移植方案并编写计划书**
+
+````markdown
+[PROMPT]
+
+任务：基于上一轮的 Linux 设计说明和框架清单，给出把 Linux Buddy 移植到 ucore 的具体方案，形成可执行的计划书；本轮仍不写代码。
+
+操作要求：
+- 明确要新增/修改的文件、每个文件负责什么。
+- 明确 Linux 概念到 ucore 字段/接口的映射。
+- 明确阶段划分和每阶段的验收方式。
+
+输出要求：
+- 一份计划书，包含文件清单、接口映射、数据结构、阶段计划、风险与未决问题。
+
+[RELY]
+
+框架事实：
+- kern/mm/pmm.c 的 init_pmm_manager() 当前选择 best_fit_pmm_manager。
+- struct pmm_manager 六接口；page_init() 调用 init_memmap(base, n)。
+- struct Page 有 property 和 page_link；free_area_t 有 free_list/nr_free。
+- 可用宏/函数：PGSIZE、PGSHIFT、page2ppn、page2pa、pa2page、set_page_ref、PageProperty/SetPageProperty/ClearPageProperty、list_*、assert、cprintf。
+
+Linux 设计要点（上一轮）：
+- free_area[order] + 块头标记 + 块头存 order。
+- 初始化最大对齐切块、分配逐级拆半、释放同 order 伙伴合并。
+
+[GUARANTEE]
+
+计划书必须包含：
+- 新增文件：kern/mm/buddy_pmm.h、kern/mm/buddy_pmm.c。
+- 修改文件：kern/mm/pmm.c，仅 include 与 USE_BUDDY_PMM 选择。
+- 模块状态：buddy_free_area[BUDDY_MAX_ORDER + 1]、buddy_nr_free。
+- 六接口签名与 manager 表。
+- 内部辅助函数：buddy_order_for()、buddy_free_block()。
+- 阶段计划：G1 骨架 → G2 初始化 → G3 分配/拆分 → G4 释放/合并 → G5 接入。
+- 每阶段的门禁命令和静态检查项。
+
+[SPECIFICATION]
+
+映射规则需要逐条写清：
+- Linux zone → ucore 单一全局状态。
+- free_area[order] → buddy_free_area[order]。
+- PageBuddy(page) → PageProperty(page)。
+- page->private → page->property（存 order，不是页数）。
+- buddy_list → page_link。
+- 绝对页号：pfn = page2ppn(page)，不能用 page - pages。
+- BUDDY_MAX_ORDER = 10，BUDDY_NR_ORDERS = 11。
+- 初始化不假设起始 pfn 大块对齐、页数是 2 的幂。
+- 分配向上取整、拆分后半块入低 order。
+- 释放按原始 order 只增加一次 buddy_nr_free，伙伴 pfn = pfn ^ (1 << order)。
+- 同 order、块头、区间内三个条件同时满足才合并。
+- 不修改 page_init()、best_fit_pmm.c、pmm.h、memlayout.h、mmu.h、libs/*、Makefile、tools/*。
+- 默认 manager 仍为 best_fit_pmm_manager。
+````
+
+**第 4 块：按计划实现**
+
+````markdown
+[PROMPT]
+
+任务：按上一轮确认的计划书实现 Buddy System，修改真实文件，不要只输出代码片段。
+
+操作要求：
+- 保留现有代码与注释；pmm.c 只做 include 与 USE_BUDDY_PMM 选择。
+- 不实现/修改 page_init()、best_fit_pmm.c、pmm.h、memlayout.h、mmu.h、libs/*、Makefile、tools/*。
+- 不新增 kern/test；本轮不写测试，buddy_check() 先留空实现。
+- 编译含 -Werror，不得有警告；不使用 malloc、printf、浮点或 libc。
+- 每完成一个阶段按 G1–G5 报告门禁结果，未通过不进入下一阶段。
+
+输出要求：
+- 直接修改项目文件，给出每阶段的编译/静态检查结果。
+
+[RELY]
+
+计划书确认的框架事实：
+- PGSIZE = 4096、PGSHIFT = 12；pfn = page2ppn(page) = page2pa(page) >> PGSHIFT。
+- 合法 pfn ∈ [nbase, npage)；页面由 pages[] 管理。
+- struct Page { ref, flags, property, page_link }；free_area_t { free_list, nr_free }。
+- 可用：PageReserved/PageProperty/Set/Clear、set_page_ref、page2pa/page2ppn/pa2page、list_init/list_add/list_del/list_empty/list_next/le2page、assert、cprintf。
+- list_add(listelm, elm) 是插入到 listelm 之后（头插）。
+- Makefile 自动收集 kern/mm/*.c，不需要改 Makefile。
+
+[GUARANTEE]
+
+必须实现：
+static void buddy_init(void);
+static void buddy_init_memmap(struct Page *base, size_t n);
+static struct Page *buddy_alloc_pages(size_t n);
+static void buddy_free_pages(struct Page *base, size_t n);
+static size_t buddy_nr_free_pages(void);
+static void buddy_check(void);
+
+必须提供：
+const struct pmm_manager buddy_pmm_manager = { ... };
+
+必须包含内部辅助函数：
+static unsigned int buddy_order_for(size_t n);
+static void buddy_free_block(struct Page *base, unsigned int order);
+
+允许新增：模块内 static 宏/变量，统一 buddy_ 前缀。
+buddy_check() 本轮只保留空实现。
+
+[SPECIFICATION]
+
+按函数给出 Pre/Post/Case/Requirements：
+
+## buddy_init
+- Pre：由 init_pmm_manager() 调用一次。
+- Post：11 条链表为空，nr_free 全 0，buddy_nr_free = 0。
+
+## buddy_order_for
+- 返回最小 order 使 2^order >= n；n=1/3/5/1024 → 0/2/3/10；
+  n>2^10 返回 BUDDY_MAX_ORDER，由 alloc 拒绝。
+
+## buddy_free_block
+- 插入一个按 2^order 对齐的块；伙伴在区间内、是块头、同 order 才合并；
+  块头取较小 pfn，order 加一继续；buddy_nr_free 只在入口按原始 order 加一次。
+
+## buddy_init_memmap
+- 逐页清 Reserved/flags/property/ref；从 pfn 起取“对齐且不越界”的最大块，
+  逐块插入；覆盖整个区间，不重叠、不漏页，不假设对齐或 2 的幂。
+
+## buddy_alloc_pages
+- n=0 或 n>2^10 返回 NULL；向上取整 order；从 order 起找第一条非空链表；
+  摘链清块头；从原 order 逐级拆到 order，后半块入低阶；返回前半块；
+  buddy_nr_free 减 2^order。
+
+## buddy_free_pages
+- 按 2^ceil(log2 n) 处理；buddy_nr_free 按原始 order 加一次；
+  伙伴 pfn = pfn ^ (1 << order)；校验区间/块头/同 order；合并到 BUDDY_MAX_ORDER 停止。
+
+## buddy_nr_free_pages
+- 返回 buddy_nr_free。
+
+## pmm.c 接入
+- 顶部 include <buddy_pmm.h>；init_pmm_manager() 用 USE_BUDDY_PMM 选择；
+  未定义时仍为 best_fit_pmm_manager。
+````
+
+**第 5 块：确认测试范围并生成测试**
+
+````markdown
+[PROMPT]
+
+任务：实现完成后，确认测试范围并生成测试套件；本轮只写测试代码并完成编译检查，真实 QEMU/GDB 运行在下一块。测试要覆盖初始化、分配、拆分、释放合并、耗尽和状态恢复；可以修改 buddy_pmm.c 的测试部分。
+
+操作要求：
+- 测试只验证 Buddy 实现，不得为通过测试修改算法。
+- 测试放在 buddy_pmm.c 的 buddy_check() 及 static 辅助函数中；不新增 kern/test，不改 Makefile、pmm.h、memlayout.h、list.h、best_fit_pmm.c、tools/*。
+- 测试必须确定、可重复，测试后恢复空闲状态；失败保留日志。
+- 默认 manager 仍是 best_fit_pmm_manager；buddy 测试只在 USE_BUDDY_PMM 下运行。
+- QEMU/GDB 不可用时用 standalone/host 沙盘并说明限制，不能把未运行写成 PASS。
+
+输出要求：
+- 直接修改文件；按 S1–S6 报告每阶段验收结果和最终输出。
+
+[RELY]
+
+测试入口：pmm_init() → check_alloc_page() → pmm_manager->check() → buddy_check()。
+可访问：buddy_free_area、buddy_nr_free、PageProperty、property、page2ppn、nbase、npage、pages。
+可用：list_next/le2page、assert、cprintf、小数组/排序/受限位图。
+ucore 模式：page_init() 已实现、best_fit 可编译、make 可构建、pmm.c 支持 USE_BUDDY_PMM。
+standalone 模式：page_init()/best_fit 缺失或无法启动时，用 fake pages：
+nbase=0x80000、npage=0x88000、pfn=0x80200、n=0x7E00，直接编译 buddy_pmm.c。
+参考值：init 32256 页、order9=1/order10=31、耗尽 32 块。
+
+[GUARANTEE]
+
+必须实现：
+static void buddy_test_init_layout(void);
+static void buddy_test_alloc_basic(void);
+static void buddy_test_split(void);
+static void buddy_test_free_merge(void);
+static void buddy_test_exhaustion(void);
+static void buddy_test_all(void);
+static void buddy_check(void);
+
+buddy_check() 只调用 buddy_test_all()；buddy_test_all() 依次调用五个测试。
+允许新增 static 辅助函数（快照、恢复断言、布局/覆盖检查、范围计算）。
+输出：[BuddyTest] init layout: PASS 等五行，最后
+[BuddyTest] ALL TESTS PASS, free pages = N。
+
+[SPECIFICATION]
+
+## 测试基础设施
+- 快照：buddy_nr_free + 每个 order 的 nr_free。
+- 恢复断言：逐 order 比较块数、比较总页数、再做布局检查。
+- 布局检查：块头/order/对齐/区间/链表长度/页数总和；排序后无重叠、无空洞。
+
+## buddy_test_init_layout
+- 检查上述全部不变量；测试前后快照一致。
+
+## buddy_test_alloc_basic
+- 1/2/4/8 页成功、互不相同、对齐、PageProperty=0、总页数减 15；
+  释放后恢复；n=0、n>2^10 返回 NULL 且状态不变。
+
+## buddy_test_split
+- 最小非空 order src，分配 1 页；返回原块头；src 块数 -1，低阶各 +1；
+  后半块在 p+2^k 且是对应块头；释放后恢复。
+
+## buddy_test_free_merge
+- 1/2/4/8 乱序释放后恢复；alloc(3) 占 4 页、free(3) 后恢复；
+  最低/最高 pfn 边界不误合并；全部取空后按分配顺序释放并恢复。
+
+## buddy_test_exhaustion
+- 大块优先分配到 NULL；所有链表为空、nr_free=0、再次分配仍 NULL；
+  分配块数等于初始块数；逆序释放后恢复。
+
+## 输出与验收
+- 五个测试各打印 PASS；最后 ALL TESTS PASS。
+- 测试代码在 ucore 模式和 standalone 模式下都能编译；
+  真实 QEMU 运行与 GDB 验证在下一块执行。
+````
+
+**第 6 块：启动 WSL，运行 QEMU 并用 GDB 验证**
+
+````markdown
+[PROMPT]
+
+任务：在 WSL 中启动真实测试环境，构建并运行 QEMU，使用 GDB 检查 Buddy 模块的初始化、分配、释放和最终状态；确认第 5 块生成的测试在真实内核中全部通过。
+
+操作要求：
+- 在 WSL 中执行，不使用模拟结果代替真实运行。
+- 先构建再运行；QEMU 版本导致启动失败时，记录现象并用本地配置解决，不修改仓库的启动代码。
+- GDB 用 -S -s 启动，target remote :1234；断点后检查变量与调用栈。
+- 只记录实际执行的命令和输出，不把未运行的检查写成 PASS。
+- 不修改 Buddy 算法、Best-Fit/SLUB 代码和课程测试。
+
+输出要求：
+- 构建命令、QEMU 串口输出、GDB transcript、关键变量的实际值。
+
+[RELY]
+
+环境：WSL Ubuntu 26.04、riscv64-unknown-elf-gcc 14.2.0、QEMU 10.2.1（OpenSBI 1.8）、riscv64-unknown-elf-gdb 17.1。
+工作目录：code/。
+启动方式：QEMU 10 的 -device loader 不设置 OpenSBI next_addr，需要
+  export QEMU="qemu-system-riscv64 -kernel bin/ucore.img"
+若 satp 后低地址取指异常，仅在本地测试副本中给启动页表加 1 GiB 恒等映射，验证后还原，不提交。
+GDB 断点：buddy_check、buddy_test_exhaustion，以及 main、buddy_init_memmap、buddy_alloc_pages、buddy_free_pages。
+参考值：buddy_nr_free = 31928；order 3/4/5/7 各 1；order 10 = 31；耗尽 35 块；串口五行 PASS。
+
+[GUARANTEE]
+
+必须给出：
+- 构建结果（无 -Werror 警告）。
+- QEMU 串口输出：memory management: buddy_pmm_manager、五行 [BuddyTest] PASS、check_alloc_page() succeeded!。
+- GDB transcript：buddy_check 的调用链、buddy_nr_free 与各 order 块数、buddy_test_exhaustion 入口的恢复值。
+- 如果 QEMU 版本需要兼容处理，给出具体现象和本地处理方式，并说明仓库未改动。
+
+[SPECIFICATION]
+
+按以下顺序执行并记录：
+1. 启动 WSL，进入 code/，设置 QEMU 环境变量。
+2. make clean && make DEFS=-DUSE_BUDDY_PMM。
+3. make qemu，确认串口输出与 5.3 节一致。
+4. 重新以 -S -s 启动 QEMU，在另一个终端用 gdb 连接：
+   - 在 buddy_check 断点确认调用链为 pmm_init → check_alloc_page → buddy_check；
+   - 检查 buddy_nr_free = 31928，order 3/4/5/7 = 1、order 10 = 31；
+   - 在 buddy_test_exhaustion 入口检查 buddy_nr_free 已恢复为 31928；
+   - 检查 buddy_alloc_pages / buddy_free_pages 的入参与返回值。
+5. 记录实际输出；失败时报告失败点、命令和最小复现，不得删除或弱化测试。
+````
+
+##### （5）实现与验证过程
+
+实现按“骨架 → 初始化 → 分配/拆分 → 释放/合并 → 接入”五个阶段完成。每阶段先保证 `make obj/kern/mm/buddy_pmm.o` 通过，再做静态检查；`pmm.c` 只增加 `#include <buddy_pmm.h>` 和 `USE_BUDDY_PMM` 选择，`page_init()` 与其他管理器未改动。
+
+模块通过特性分支 `feat/buddy-pmm`（提交 `b45a97c`）提交，经 PR #1 合并为 `0143fb6`。合并后的测试代码位于 `buddy_check()`，只在 `USE_BUDDY_PMM` 下由 `check_alloc_page()` 调用；默认 Best-Fit 构建不会执行这些测试。测试内容、真实输出和 GDB 记录见 5.3 节。
 
 ### 4.3 Challenge：简化 SLUB 内存对象分配器
 
@@ -1244,6 +1706,114 @@ check_alloc_page() succeeded!
 ```
 
 普通运行没有输出 SLUB 自检信息，验证宏关闭后不会进入测试入口。该镜像初始空闲页数为 31929，而自检镜像为 31928，来自不同构建的内核占用差异；是否发生页面泄漏，应比较同一自检镜像运行前后的值，本次为 `31928 -> 31928`。两次 QEMU 均在观察到检查完成后使用 `Ctrl-a x` 正常退出，没有将超时作为成功依据。
+
+### 5.3 成员三：Buddy System 的验证记录
+
+本节记录最新 `lab2` 代码上的实际执行结果。本次 Buddy 验证在 WSL Ubuntu 26.04、`riscv64-unknown-elf-gcc 14.2.0`、QEMU 10.2.1（OpenSBI v1.8）和 GDB 17.1 下完成。QEMU 10 对课程启动链有两个兼容性影响，先说明处理方式，再给出结果。
+
+**启动参数。** QEMU 10 的 `-device loader` 不再为 OpenSBI 设置 `next_addr`，启动日志会显示 `Next Address: 0x0`，内核不会执行。解决方式是在 `~/.bashrc` 中设置：
+
+```sh
+export QEMU="qemu-system-riscv64 -kernel bin/ucore.img"
+```
+
+这样 Makefile 中的 `$(QEMU)` 会先带 `-kernel bin/ucore.img`，OpenSBI 得到 `next_addr=0x80200000`。
+
+**启动页表。** 仅解决 `next_addr` 仍不够：`entry.S` 执行 `csrw satp` 后，下一条指令仍在物理地址 `0x80200038`；QEMU 10 会对该 PC 重新翻译，而 `boot_page_table_sv39` 只映射高地址 `0xFFFFFFFFC0000000 → 0x80000000`，于是触发 `exec_page_fault`。测试时临时在启动页表增加一个 1 GiB 恒等映射（entry 2），验证后已用 `git checkout -- code/kern/init/entry.S` 还原，仓库中没有保留该补丁。该问题属于 QEMU 版本兼容，不是 Buddy 算法的一部分，也不影响课程环境（QEMU 4.1.1）的启动方式。
+
+**内核内验证。** 在 `code/` 下执行：
+
+```bash
+export QEMU="qemu-system-riscv64 -kernel bin/ucore.img"
+make clean
+make DEFS=-DUSE_BUDDY_PMM
+make qemu
+```
+
+构建无 `-Werror` 警告。串口关键输出为：
+
+```text
+memory management: buddy_pmm_manager
+free memory: PA [0x0000000080348000, 0x0000000088000000), 31928 pages
+[BuddyTest] detail: free pages 31928
+[BuddyTest] detail: order 3 blocks 1
+[BuddyTest] detail: order 4 blocks 1
+[BuddyTest] detail: order 5 blocks 1
+[BuddyTest] detail: order 7 blocks 1
+[BuddyTest] detail: order 10 blocks 31
+[BuddyTest] init layout: PASS
+[BuddyTest] alloc basic: PASS
+[BuddyTest] detail: split from order 3 to order 0
+[BuddyTest] split: PASS
+[BuddyTest] free/merge: PASS
+[BuddyTest] detail: exhausted in 35 blocks
+[BuddyTest] exhaustion: PASS
+[BuddyTest] all: PASS
+[BuddyTest] ALL TESTS PASS, free pages = 31928
+check_alloc_page() succeeded!
+```
+
+测试覆盖情况如下表。每个测试都先拍快照，结束后逐项比较 `buddy_nr_free` 和每个 order 的块数，并再次检查链表布局，因此 PASS 不只是打印结果。
+
+| 测试函数 | 验证内容 |
+|---|---|
+| `buddy_test_init_layout()` | 每个节点是块头且 `property==order`；pfn 按 `2^order` 对齐并落在 `[nbase,npage)`；链表长度等于 `nr_free`；页数总和等于 `buddy_nr_free`；按 pfn 排序后无重叠、无空洞地覆盖连续区间 |
+| `buddy_test_alloc_basic()` | 分配 1/2/4/8 页成功、互不相同、对齐、块头 `PageProperty==0`；`buddy_nr_free` 减少 15；释放后恢复；`n=0`、`n>2^10` 返回 `NULL` 且状态不变；追加 `n=5`（占 8 页）和 `n=1024`（占 1024 页） |
+| `buddy_test_split()` | 从最小非空 order `src` 分配 1 页，返回原块头；`src` 块数 -1，每个低 order 块数 +1；拆出的后半块在 `p+2^k` 处且是对应 order 的块头；释放后恢复 |
+| `buddy_test_free_merge()` | 1/2/4/8 页乱序释放后恢复；`alloc(3)` 占 4 页、`free(3)` 后恢复；最低 pfn 两页先高后低释放；最大 order 取空全部页，确认 `pfn==lo` 与 `end==hi` 的块存在，再按分配顺序释放 |
+| `buddy_test_exhaustion()` | 大块优先分配到 `NULL`；耗尽后所有链表为空、`buddy_nr_free==0`、再次分配仍 `NULL`；分配块数等于初始块数；逆序释放后恢复 |
+
+**测试范围。** Buddy 测试只在 `USE_BUDDY_PMM` 下由 `check_alloc_page()` 调用；默认构建不执行 `buddy_check()`。本节只报告 Buddy 自身的结果。
+
+**独立裸机验证。** 为排除对真实内核地址和页数的依赖，另用 fake `pages[]`（`nbase=0x80000`、`npage=0x88000`、`pfn=0x80200`、`n=0x7E00`）直接编译同一份 `buddy_pmm.c`，在 QEMU/OpenSBI 下运行：
+
+```text
+QEMU Buddy test start
+[BuddyTest] detail: free pages 32256
+[BuddyTest] detail: order 9 blocks 1
+[BuddyTest] detail: order 10 blocks 31
+[BuddyTest] init layout: PASS
+[BuddyTest] alloc basic: PASS
+[BuddyTest] detail: split from order 9 to order 0
+[BuddyTest] split: PASS
+[BuddyTest] free/merge: PASS
+[BuddyTest] detail: exhausted in 32 blocks
+[BuddyTest] exhaustion: PASS
+[BuddyTest] all: PASS
+[BuddyTest] ALL TESTS PASS, free pages = 32256
+QEMU BUDDY TEST PASS
+```
+
+**GDB 验证。** 在 QEMU 的 `-S -s` 下以 `buddy_check` 和 `buddy_test_exhaustion` 为断点，确认调用链和内部状态：
+
+```text
+#0 buddy_check () at kern/mm/buddy_pmm.c:624
+#1 check_alloc_page () at kern/mm/pmm.c:169
+#2 pmm_init () at kern/mm/pmm.c:160
+#3 kern_init () at kern/init/init.c:45
+$1 = 31928      # buddy_nr_free
+$2 = 1          # order 3
+$3 = 1          # order 4
+$4 = 1          # order 5
+$5 = 1          # order 7
+$6 = 31         # order 10
+```
+
+在 `buddy_test_exhaustion` 入口再次断点，`buddy_nr_free` 仍为 31928，说明前四组测试已完整恢复状态。
+
+**数据对照。** 两种运行环境的初始布局不同：
+
+| 指标 | 独立裸机（fake 区间） | 真实 ucore |
+|---|---|---|
+| 空闲页 | 32256 | 31928 |
+| 初始块 | 1×order 9 + 31×order 10 = 32 | 1×order 3 + 1×order 4 + 1×order 5 + 1×order 7 + 31×order 10 = 35 |
+| 耗尽块数 | 32 | 35 |
+| 分配 1 页后空闲页 | 32255 | 31927 |
+| 释放后空闲页 | 32256 | 31928 |
+
+差异来自 `page_init()` 交给分配器的空闲区形状：fake 区间从 `0x80200` 开始，按 order 9 切出第一块；真实内核的空闲区从 `0x80348` 开始，只能先切出 order 3/4/5/7。两种情况下“大块优先耗尽块数等于初始块数”的关系一致，所有测试也都通过。
+
+**结论。** 五组测试在真实内核中全部 PASS，`check_alloc_page() succeeded!`；独立裸机测试在另一种区间形状下同样全部 PASS；GDB 确认了调用链和计数。没有出现需要修改 Buddy 算法才能通过测试的情况，也没有删除或弱化课程测试。
 
 ---
 
