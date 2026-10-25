@@ -1586,6 +1586,49 @@ void slub_selftest(void);
 
 ---
 
+### 4.4 分支任务：GDB 调试页表查询过程
+
+**负责人：** 2411326-张晨旭
+
+#### 4.4.1 实验目标与要求
+
+本任务通过调试 QEMU 源码，研究 RISC-V 访存如何经过软件 TLB 查询、Miss 处理、Sv39 页表遍历和映射填充。目标是将客户机指令产生的地址与模拟器实际执行的转换过程对应起来，并理解软件模拟 MMU 与真实硬件的区别，而非新增内核功能。
+
+指导书的六项要求分别是：分析关键调用路径及条件分支；单步观察页表翻译；定位软件 TLB 查询代码并解释细节；比较模拟器 TLB 与真实 CPU TLB 的逻辑差异，并尝试 Bare/Sv39 对照；记录调试问题与发现；记录利用大模型解决问题的过程。本节按这些要求解释实现机制，第 5.4 节依据实际输出说明完成程度。课程自动评分通过与本分支的动态调试完成属于不同结论。
+
+#### 4.4.2 调试方案与访存目标
+
+选取 `code/kern/init/init.c` 中的 `memset(edata, 0, end - edata)` 为访存来源。该调用在 `dtb_init()` 和 `pmm_init()` 之前清零 BSS；其执行前，`entry.S` 已通过静态启动页表、`satp` 和 `sfence.vma` 建立高地址内核运行环境。因此，本次观察的是启动映射下的数据访问，并非 `page_init()` 建立页表的过程。
+
+使用当前 ELF 的 `nm` 和反汇编定位 `edata`、`end`、`memset`，不沿用旧调试地址。`code/libs/string.c` 的字节循环编译为 `sb a1,-1(a5)`；第一次执行前，a1 为零，a5 由目标首地址递增一字节，所以有效地址为 `a5-1=edata`。指令 PC 与该数据 VA 必须区分。指令及寄存器来源由源码和 ELF 静态确定，运行时则通过 QEMU 回调中的地址、宽度、访问类型、写入值和调用栈进行核对；本方案未直接停住客户机并读取该指令前的全部寄存器。
+
+#### 4.4.3 软件 TLB 查询与 Miss 处理机制
+
+QEMU 的 TCG 将客户机指令翻译为主机代码。对本机 x86 主机，`tcg/i386/tcg-target.inc.c` 中的 `tcg_out_qemu_st()` 调用 `tcg_out_tlb_load()` 生成写访问的快速查询；能够直接满足的访问可在生成代码中完成。不能认为每次 TLB 查询或 Hit 都必须经过某个 C helper。
+
+在 `accel/tcg/cputlb.c` 的 `store_helper()` 慢路径中，代码依据地址和 MMU 索引定位软件条目，检查写标签，并在需要时查询 victim TLB。主表和 victim 均不能满足时，才从本次命中的 1522 行调用 `tlb_fill()`，继而进入 RISC-V 的 `riscv_cpu_tlb_fill()`。本次动态栈与随后设置的断点共同构成以下路径：
+
+```text
+TCG 生成代码 code_gen_buffer
+  → helper_ret_stb_mmu → store_helper
+  → tlb_fill → riscv_cpu_tlb_fill
+      → get_physical_address
+      → 转换结果及物理访问权限检查
+      → tlb_set_page
+```
+
+其中前半段由实际调用栈支持，`get_physical_address()` 与 `tlb_set_page()` 由后续断点分别确认；图中不是一次性打印的完整栈。`riscv_cpu_tlb_fill()` 将 `address`、`access_type`、`mmu_idx` 传入地址转换函数，转换成功后再按需检查 PMP 权限，最后将页对齐的 VA、PA 和访问权限交给软件 TLB。进入该函数本身并不足以判断 Miss 的具体原因，还需核对实际调用位置和相应分支。
+
+#### 4.4.4 Sv39 页表遍历与填充设计
+
+`target/riscv/cpu_helper.c` 的 `get_physical_address()` 首先根据 MMU 索引与特权状态确定有效模式。M 模式及无 MMU 情况可以直接映射；在使用 `satp` 的路径中，MODE 决定分页方案，PPN 左移 12 位得到根表物理地址。Sv39 使用最多三级页表，每级九位索引，64 位 PTE 占八字节。
+
+查表从根级开始，以当前层 VPN 索引计算 PTE 的物理地址，经物理内存读取取得 PTE，再提取 PPN。V 为零时转换失败；R/W/X 全为零表示下一级表指针；否则按叶子项检查编码、特权级、读写执行权限及超级页对齐。若遇到根级叶子，则映射粒度为 1 GiB，不再读取下两级。本实验启动页表即包含这样的映射，实际访问的层数应由运行结果判定。
+
+叶子通过检查后，QEMU 按需处理 A/D 位，再将叶子 PPN 与超级页所需的低位 VPN 拼接。该版本对本次访问返回 4 KiB 对齐的物理页基址，完整字节 PA 还需结合 VA 的页内偏移。`riscv_cpu_tlb_fill()` 随后调用 `tlb_set_page()`，后者通过 `tlb_set_page_with_attrs()` 执行软件条目设置。这里应区分客户机 VA、客户机 PA，以及宿主进程中的指针；输出参数 `physical` 是宿主指针，`*physical` 才是待返回的客户机物理页基址。
+
+---
+
 ## 五、测试与验证
 
 课程自动评分截图显示总分为 **20/20**，其中 `check page init` 和 `check best fit` 均为 `OK`。
@@ -1814,6 +1857,130 @@ $6 = 31         # order 10
 差异来自 `page_init()` 交给分配器的空闲区形状：fake 区间从 `0x80200` 开始，按 order 9 切出第一块；真实内核的空闲区从 `0x80348` 开始，只能先切出 order 3/4/5/7。两种情况下“大块优先耗尽块数等于初始块数”的关系一致，所有测试也都通过。
 
 **结论。** 五组测试在真实内核中全部 PASS，`check_alloc_page() succeeded!`；独立裸机测试在另一种区间形状下同样全部 PASS；GDB 确认了调用链和计数。没有出现需要修改 Buddy 算法才能通过测试的情况，也没有删除或弱化课程测试。
+
+---
+
+### 5.4 成员一：GDB 页表查询的单宿主调试验证
+
+**负责人：** 2411326-张晨旭
+
+#### 目标指令与断点设置
+
+当前 ELF 的符号与反汇编核对结果如下：
+
+```text
+ffffffffc02000d8 T kern_init
+ffffffffc0201706 T memset
+ffffffffc0205000 D boot_page_table_sv39
+ffffffffc0206018 D edata
+ffffffffc0206078 B end
+
+ffffffffc020170a: 87aa      mv   a5,a0
+ffffffffc020170c: 0785      addi a5,a5,1
+ffffffffc020170e: feb78fa3  sb   a1,-1(a5)
+```
+
+清零范围为 `[edata,end)`，长度 `0x60=96` 字节。首次目标 VA 为 `0xffffffffc0206018`，来源于 `edata`，不是指令地址 `0xffffffffc020170e`。以下条件用于在冷启动期间筛选该数据写；`$va` 在启动 GDB 时由当前 ELF 的 `edata` 注入。
+
+```gdb
+break riscv_cpu_tlb_fill if address == $va && access_type == MMU_DATA_STORE && probe == 0
+run
+info args
+bt 5
+```
+
+该轮以宿主 GDB 直接运行调试版 QEMU，使用 `-machine virt`、`-display none`、`-monitor none`、文件串口、OpenSBI `fw_jump` 及 `-device loader,file=bin/ucore.img,addr=0x80200000`。
+
+#### 数据写与 TLB Miss 的实际输出
+
+主日志记录：
+
+```text
+address = 18446744072637931544
+size = 1
+access_type = MMU_DATA_STORE
+mmu_idx = 1
+probe = false
+#0 riscv_cpu_tlb_fill (...) at target/riscv/cpu_helper.c:438
+#1 ... in tlb_fill (...) at accel/tcg/cputlb.c:878
+#2 ... in store_helper (... val=0, ...) at accel/tcg/cputlb.c:1522
+#3 helper_ret_stb_mmu (... val=0 '\000', ...) at accel/tcg/cputlb.c:1642
+#4 ... in code_gen_buffer ()
+```
+
+其中十进制 `address` 换算为 `0xffffffffc0206018`，与目标 VA 一致；宽度为一字节、写入值为零，与 BSS 的 `sb` 对应。
+
+#### satp、PTE 与实际页表层级
+
+在转换函数入口读取 `env->satp`，再在本机 `cpu_helper.c:259` 停止，此时 PTE 及 PPN 已完成赋值：
+
+```gdb
+tbreak get_physical_address
+continue
+p/x env->satp
+p mmu_idx
+tbreak target/riscv/cpu_helper.c:259
+continue
+p i
+p ptshift
+p/x idx
+p/x pte_addr
+p/x pte
+p/x ppn
+p (pte & 0xe) == 0
+next
+```
+
+主日志的 `$1` 至 `$9` 依次为 `0x8000000000080205`、`1`、`0`、`18`、`0x1ff`、`0x80205ff8`、`0x200000cf`、`0x80000`、`0`。其含义及计算如下：
+
+| 参数 | 实测值或由实测值计算的结果 | 说明 |
+|---|---|---|
+| satp | `0x8000000000080205` | 实读寄存器状态 |
+| MODE / ASID / 根 PPN | `8 / 0 / 0x80205` | 从 satp 位域解码，选择 Sv39 |
+| 根页表 PA | `0x80205000` | 根 PPN 左移 12 位 |
+| VA 的 VPN[2:0] | `511 / 1 / 6` | 按每级九位计算；本轮根级 idx 实读为 511 |
+| 页内偏移 | `0x18` | VA 低 12 位 |
+| i / ptshift | `0 / 18` | 当前为根级迭代，超级页低位 VPN 占 18 位 |
+| PTE 物理地址 | `0x80205ff8` | `0x80205000 + 511 × 8` |
+| PTE / PPN | `0x200000cf / 0x80000` | PPN 为 PTE 右移 10 位 |
+| PTE 标志 | V/R/W/X/A/D=1，U/G=0 | 由实际 PTE 低位解码 |
+
+`(pte & 0xe)==0` 的实际结果为假，`next` 后停在 262 行而未执行下一级表指针处理，证明当前项为叶子。根级叶子对应 1 GiB 映射，且 PPN 低 18 位为零，满足超级页对齐。本次只读取一个根 PTE；VPN[1]、VPN[0] 参与超级页物理地址形成，没有用于读取第二、三级 PTE。
+
+#### 最终物理地址与填充参数
+
+继续执行到物理页基址已赋值的 337 行，再观察填充入口：
+
+```gdb
+until target/riscv/cpu_helper.c:337
+p/x *physical
+p/x (*physical | (addr & 0xfff))
+tbreak tlb_set_page
+continue
+info args
+```
+
+主日志输出 `$10=0x80206000`、`$11=0x80206018`。按实测 PTE 与 VA 手工核算：
+
+```text
+vpn    = VA >> 12
+pagePA = (0x80000 | (vpn & 0x3ffff)) << 12 = 0x80206000
+PA     = pagePA | (VA & 0xfff)             = 0x80206018
+```
+
+计算值与转换函数输出一致。`until` 运行越过了中间权限、对齐和 A/D 检查，到达物理页基址形成后的语句，并随后进入填充；这说明本次转换未从错误分支提前返回，但不能描述为所有检查都已逐句单步。PTE 已置 A/D 位，源码分析表明本次写访问无需因这两个位执行更新；本轮未在原子更新分支内部设置断点。
+
+`tlb_set_page()` 入口实际参数为：
+
+| 参数 | 原始输出 | 十六进制或含义 |
+|---|---|---|
+| vaddr | `18446744072637931520` | `0xffffffffc0206000`，虚拟页基址 |
+| paddr | `2149605376` | `0x80206000`，物理页基址 |
+| prot | `7` | QEMU 的读、写、执行权限集合 |
+| mmu_idx | `1` | 本轮 S 模式访存上下文 |
+| size | `4096` | 本次软件 TLB 填充粒度为 4 KiB |
+
+因此，完整字节地址、页表映射和填充参数相互一致。
 
 ---
 
