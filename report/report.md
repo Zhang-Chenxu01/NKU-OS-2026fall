@@ -34,7 +34,7 @@
 | --- | --- | --- |
 | 2411326-张晨旭 | 待填写 | 待填写 |
 | 2411566-罗晟皓 | OpenAI Codex | `gpt6-luna` |
-| 2413042-郭桦 | 待填写 | 待填写 |
+| 2413042-郭桦 | DeepSeek Harness | `deepseek-flash` |
 
 ### 运行环境
 
@@ -238,7 +238,112 @@ case IRQ_S_TIMER:
 
 **负责人：** 2413042-郭桦
 
-本节由负责人补充模块设计、实现及测试记录。
+#### 4.3.1 模块功能描述
+
+异常处理由 [trap.c](../code/kern/trap/trap.c) 中的 `exception_handler()` 完成，接口为：
+
+```c
+void exception_handler(struct trapframe *tf);
+```
+
+`trap_dispatch()` 通过 `(intptr_t)tf->cause < 0` 把同步异常交给该函数。函数区分实验要求的两类异常——断点（`CAUSE_BREAKPOINT`）与非法指令（`CAUSE_ILLEGAL_INSTRUCTION`）——输出规定提示并把 `tf->epc` 调整为触发指令之后的位置，使 `sret` 返回后不再重复执行同一条异常指令；其余异常只打印 Trap frame 供调试，不改变执行位置。
+
+#### 4.3.2 关键接口与设计
+
+| 接口或数据 | 定义位置 | 用途 |
+| --- | --- | --- |
+| `struct trapframe`、`tf->cause`、`tf->epc` | [trap.h](../code/kern/trap/trap.h) | 读取异常原因码与 Trap 返回位置 |
+| `CAUSE_ILLEGAL_INSTRUCTION = 0x2`、`CAUSE_BREAKPOINT = 0x3` | [riscv.h](../code/libs/riscv.h) | 异常原因码匹配 |
+| `print_trapframe(tf)` | [trap.c](../code/kern/trap/trap.c) | 未知异常的现场输出 |
+| `cprintf()`（`%lx`） | [printfmt.c](../code/libs/printfmt.c) | 输出 `epc` 的完整 64 位地址 |
+| `insn_length()` | trap.c（新增，文件内 `static`） | 读取 `epc` 处指令，判断 16/32 位 |
+
+`exception_handler()` 定义在 `interrupt_handler()` 之后、`trap_dispatch()` 之前。`trap.h` 没有该函数的原型，把定义放在调用点之前即可消除隐式声明，无需修改公共头文件。
+
+#### 4.3.3 具体实现
+
+**（1）异常分类与返回位置更新。**
+
+断点和非法指令都是"执行到该指令即触发"的同步异常，`sepc` 指向触发指令本身。如果不调整 `sepc`，`sret` 会回到同一条指令并再次触发异常，形成死循环。因此两个分支分别在输出提示后执行 `tf->epc += 指令长度`，让返回位置落到下一条指令。
+
+**（2）按指令实际长度前进。**
+
+RISC-V 同时存在 16 位压缩指令（RVC）和 32 位标准指令，不能一律 `+4`。实现用一个读取半字的辅助函数判断：
+
+```c
+/* Length of the instruction at epc: 2 bytes for RVC, 4 bytes otherwise. */
+static size_t insn_length(uintptr_t epc) {
+    uint16_t insn = *(volatile uint16_t *)epc;
+    return (insn & 0x3) == 0x3 ? 4 : 2;
+}
+```
+
+RISC-V 规定 32 位指令的低两位为 `0b11`，16 位压缩指令的低两位不是 `0b11`，因此读取 `epc` 处 2 字节即可确定长度。本实验内核代码位于高地址 `0xffffffffc0...`，已由启动页表映射，S 模式读取该地址是安全的。
+
+**（3）未知异常兜底。**
+
+默认分支调用 `print_trapframe(tf)`，输出通用寄存器、`status`、`epc`、`badvaddr`、`cause`。默认分支**不读取** `epc`：课程测试会用 `memset` 清零的 trapframe（`epc = 0`）直接调用本函数，若在默认分支解引用 `epc` 会触发 load page fault 并再次进入 Trap。
+
+最终实现如下：
+
+```c
+/* Length of the instruction at epc: 2 bytes for RVC, 4 bytes otherwise. */
+static size_t insn_length(uintptr_t epc) {
+    uint16_t insn = *(volatile uint16_t *)epc;
+    return (insn & 0x3) == 0x3 ? 4 : 2;
+}
+
+//lab3 function2 2413042
+void exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+        case CAUSE_BREAKPOINT:
+            cprintf("Breakpoint at 0x%lx\n", tf->epc);
+            tf->epc += insn_length(tf->epc);
+            break;
+        case CAUSE_ILLEGAL_INSTRUCTION:
+            cprintf("Illegal instruction at 0x%lx\n", tf->epc);
+            tf->epc += insn_length(tf->epc);
+            break;
+        default:
+            print_trapframe(tf);
+            break;
+    }
+}
+```
+
+#### 4.3.4 Spec 与 Prompt
+
+**Pre-Condition：** `tf` 指向有效的 Trap frame，`tf->cause` 保存异常原因码，`tf->epc` 为触发异常的指令地址；`stvec` 已指向 `__alltraps`，`SAVE_ALL` 已完成现场保存；内核代码段已映射，可读。
+
+**Post-Condition：** 断点与非法指令处理后，`tf->epc` 指向触发指令之后，`sret` 返回时继续执行后续指令；其他异常输出完整 Trap frame 且不改变 `tf->epc`。函数不修改通用寄存器、`status`、`badvaddr` 与 `cause`，不触发第二次 Trap。
+
+| Case | 行为要求 |
+| --- | --- |
+| Case 1：断点异常 | 输出 `Breakpoint at 0x<epc>`，`epc` 前进 4 字节后返回原执行流 |
+| Case 2：非法指令异常 | 输出 `Illegal instruction at 0x<epc>`，`epc` 按实际指令长度前进 |
+| Case 3：16 位压缩指令 | 低两位不是 `0b11`，`epc += 2` |
+| Case 4：其他异常 | 调用 `print_trapframe(tf)`，不改变、不读取 `epc` |
+| Case 5：清零 trapframe 直接调用 | `cause = 20`、`epc = 0` 时只打印现场，不产生二次异常 |
+
+实现约束：不修改 `trap_dispatch()`、`trap()`、`trapentry.S`、`interrupt_handler()` 与评分脚本；保留 `lab3` 标记；输出前缀必须包含 `Breakpoint at` 与 `Illegal instruction at`，这是评分脚本的检查项。
+
+本次使用的分层 Prompt 见 [异常处理功能实现提示词](prompt.md#异常处理功能实现提示词)。
+
+#### 4.3.5 实现及验证过程
+
+| 阶段 | 内容 | 验证重点 |
+| --- | --- | --- |
+| 接口梳理 | 阅读 `trap.h`、`trapentry.S`、`trap_dispatch()` 与 `tools/test_lab3*`，确认插入位置与测试期望 | 原因码、`epc` 语义、默认分支的调用方式 |
+| 函数实现 | 新增 `insn_length()` 与 `exception_handler()` | 交叉编译通过，无隐式声明 |
+| 集成验证 | `make`、`make qemu`、`make grade` | 三个用例得分与串口关键输出 |
+
+实际遇到的问题与处理：
+
+1. **定义位置**：`trap_dispatch()` 先调用后定义，`trap.h` 也没有原型，`-Werror` 下直接编译失败。把 `exception_handler()` 定义在 `trap_dispatch()` 之前解决，未改动公共头文件。
+2. **默认分支读取 `epc` 会二次异常**：评分脚本用清零的 trapframe 直接调用 `exception_handler()`（`cause = 20`、`epc = 0`）。因此只在断点/非法指令分支读取 `epc`，默认分支仅打印现场。
+3. **本地工具链与 QEMU 版本差异**：本机 binutils 2.45 不再识别旧 CSR 别名 `sbadaddr`，QEMU 10.2.1 也与仓库默认的 `-device loader` 启动方式不兼容。这两点通过只在本机生效的构建/启动适配解决，不进入提交代码，也不影响功能实现；详见 5.1、5.3。
+
+集成结果：`make grade` 三个用例全部通过，合计 **100/100**（Test 1 35/35、Test 2 25/25、Test 3 40/40），具体输出见 5.2。
 
 ---
 
@@ -251,6 +356,10 @@ case IRQ_S_TIMER:
 独立 RISC-V 交叉编译提取实际 `interrupt_handler()`、`print_ticks()` 和必要常量，使用项目头文件及 `-mcmodel=medany`、`-std=gnu99`、`-Wall`、`-Werror`、`-fno-builtin`、`-nostdinc` 等相关参数生成对象文件。该检查覆盖函数与接口声明的编译兼容性，不包含完整内核链接。
 
 模拟接口测试由宿主 GCC 编译运行，直接调用处理函数。时钟替身记录重新设置的次数和时机，输出替身捕获文字，现场打印替身检查传入指针，关机替身检查触发时点。每次处理前后逐字节比较 Trap frame，以检查 EPC 和其他保存字段是否改变。该方法验证函数行为，不产生真实硬件中断，也不执行 `sret` 或固件关机。
+
+集成验证使用课程评分流程：`make` 完成全量构建；`make qemu` 进行普通启动；`make grade` 通过 Makefile 把源码复制到 `/tmp/lab3_grade`，用 `tools/inject.py` 注入 `kern/test` 与三个测试调用，再由 `tools/grade.sh` 分别以 `GRADE_LAB3_CONTEXT`、`GRADE_LAB3_ILLEGAL`、`GRADE_LAB3_TIMER` 构建并运行 QEMU，按串口输出中的 sentinel 与关键字记分。
+
+本机 QEMU（10.2.1）比课程环境新：`-device loader` 不再设置 OpenSBI 的下一跳地址，且写入 `satp` 后会重新翻译下一条取指；本机 binutils 2.45 也移除了旧 CSR 别名 `sbadaddr`。本地验证时使用仅在本机生效的构建/启动适配（`-kernel` 启动方式与 `sbadaddr` 别名映射），不包含在提交代码中；评分所用的测试代码、Makefile 与评分脚本均未修改。
 
 ### 5.2 已执行的测试结果
 
@@ -265,18 +374,28 @@ case IRQ_S_TIMER:
 | 300 ticks 后关机调用 | 通过 | 第三次统计输出完成后调用一次关机替身接口 |
 | Trap frame 保持不变 | 通过 | 调用前后现场逐字节一致，包含 EPC 与原始原因值 |
 | 未知原因格式化 | 通过 | 原因 15 及较大的 64 位原因值均正确输出 |
+| 完整构建 `make` | 通过 | 全部目标编译、链接成功 |
+| 普通启动 `make qemu` | 通过 | 输出 `os is loading`、`++ setup timer interrupts`，3 次 `100 ticks` 后关机 |
+| Test 1：Trap 入口、寄存器恢复与断点 EPC | 通过（35/35） | `Breakpoint at 0xffffffffc0201c78`，随后 `[Test 1] Trap entry and breakpoint return: PASS` |
+| Test 2：非法指令 EPC 前进与兜底 | 通过（25/25） | `Illegal instruction at 0xffffffffc0201c28`、`Supervisor software interrupt`、`Unknown interrupt: cause 15`、`cause    0x00000014`，随后 `[Test 2] Illegal instruction return: PASS` |
+| Test 3：时钟重设与持续 Trap 返回 | 通过（40/40） | `100 ticks`、`[Test 3] Sustained supervisor timer: PASS (40/40, ticks=200)` |
+| `make grade` 合计 | 通过（100/100） | 三个用例全部 PASS |
 
-关机替身在被调用时检查 `ticks=300`、重设次数为 300、累计统计输出为三次，并核对输出已完成。因此，第三次统计与关机请求的先后关系具有函数级验证结果；QEMU 是否实际退出需要由完整运行确认。
+关机替身在被调用时检查 `ticks=300`、重设次数为 300、累计统计输出为三次，并核对输出已完成。因此，第三次统计与关机请求的先后关系具有函数级验证结果；完整 QEMU 运行中第三次 `100 ticks` 输出后内核确实退出，与函数级结果一致。
 
 独立验证的原始执行日志、复现材料及截图归档：待填写。
 
 ### 5.3 完整构建与集成状态
 
-已执行的一次完整构建尝试在 `trap_dispatch()` 调用 `exception_handler()` 处出现隐式声明错误，并因 `-Werror` 停止。该次构建未通过。入口、上下文恢复和异常处理尚待完善，完整 QEMU 运行与 `make grade` 尚未执行。
+补齐 `exception_handler()` 后，`trap_dispatch()` 处的隐式声明错误消除，全量构建通过。`make`、`make qemu`、`make grade` 均已在集成后的代码上执行：
 
-独立编译与模拟测试的通过只对应 5.1 所述验证范围，不计作完整内核或课程评分通过。集成结果及实际得分：待填写。
+- `make`：全部目标编译、链接成功；
+- `make qemu`：内核正常启动，打印 `(THU.CST) os is loading ...` 与 `++ setup timer interrupts`，随后每 100 次时钟中断输出一行 `100 ticks`，第三次输出后经由 `sbi_shutdown()` 结束；
+- `make grade`：三个用例分别得到 35/25/40，合计 **100/100**。
 
-后续集成测试的具体方案与结果由负责最终集成的成员补充。
+评分流程把源码复制到临时目录后再注入测试，不修改工作区源码。本机 QEMU 版本较新，启动适配只在本地生效；提交代码中的入口、处理函数、测试注入与评分脚本均保持课程要求的形式。
+
+集成结果：Test 1 的断点返回与寄存器恢复通过；Test 2 的非法指令返回、软中断提示、未知中断提示与未知异常现场输出通过；Test 3 的持续时钟中断到 `ticks=200` 通过。
 
 ---
 

@@ -347,3 +347,63 @@ Requirements：
 
 本次不要执行 Git commit 或 push，等待我审核后再提交。
 ```
+
+# 异常处理功能实现提示词
+
+```text
+异常与断点处理功能的实现
+工作目录：NKU-OS-2026fall/code
+
+[PROMPT]
+
+请基于当前项目的真实源码，实现 kern/trap/trap.c 中的异常处理功能 exception_handler()。
+
+只在该函数所在区域（interrupt_handler() 之后、trap_dispatch() 之前）修改，必要时增加文件内的 static 辅助函数；保持其他函数与接口不变。
+
+[RELY]
+
+struct trapframe 及其成员 gpr、status、epc、badvaddr、cause
+CAUSE_ILLEGAL_INSTRUCTION（0x2）、CAUSE_BREAKPOINT（0x3）
+print_trapframe()
+cprintf()（printfmt 支持 %lx / %08x）
+trap_dispatch() 的分发条件
+tools/test_lab3.c 中的 test_lab3_illegal_instruction() 与 test_lab3_handler_fallbacks()
+tools/grade.sh 的关键字检查
+
+[GUARANTEE]
+
+实现：
+
+void exception_handler(struct trapframe *tf);
+
+要求：断点与非法指令输出规定提示并更新 tf->epc；其他异常调用 print_trapframe(tf) 兜底；不修改函数签名，不修改其他函数。
+
+[SPECIFICATION]
+
+Pre-Condition：
+tf 指向有效 trapframe，tf->cause 为异常原因码，tf->epc 为触发指令地址；stvec 已指向 __alltraps，SAVE_ALL 已保存现场。
+
+Post-Condition：
+断点/非法指令处理后 tf->epc 指向触发指令之后，sret 返回后继续执行；其他异常输出现场且不改变 tf->epc。
+
+Case 1：CAUSE_BREAKPOINT
+输出 Breakpoint at 0x<epc>，epc 增加该指令长度。
+
+Case 2：CAUSE_ILLEGAL_INSTRUCTION
+输出 Illegal instruction at 0x<epc>，epc 增加该指令长度。
+
+Case 3：指令长度判断
+RISC-V 32 位标准指令低两位为 0b11，16 位压缩指令不是；读取 epc 处半字判断，不能一律 +4。该地址必须可读：本实验内核代码位于 0xffffffffc0...，已映射。
+
+Case 4：其他异常
+调用 print_trapframe(tf)。不得在默认分支读取 epc：测试会传入 memset 清零的 trapframe（epc = 0），读取会触发二次异常。
+
+Requirements：
+1. 保留 lab3 标记，学号 2413042。
+2. 不修改 trap_dispatch()、trap()、trapentry.S、interrupt_handler()、init.c 与评分脚本。
+3. 输出必须包含 Breakpoint at / Illegal instruction at 前缀。
+4. 不进行无关重构或额外功能开发。
+
+完成后执行 make、make qemu、make grade 验证，报告修改内容、测试结果与遗留问题。不要执行 Git commit 或 push。
+```
+
