@@ -32,7 +32,7 @@
 
 | 成员 | AI 编程工具 | 底层模型 |
 | --- | --- | --- |
-| 2411326-张晨旭 | 待填写 | 待填写 |
+| 2411326-张晨旭 | OpenAI Codex | `gpt6-luna` |
 | 2411566-罗晟皓 | OpenAI Codex | `gpt6-luna` |
 | 2413042-郭桦 | DeepSeek Harness | `deepseek-flash` |
 
@@ -96,7 +96,145 @@ intr_enable()
 
 **负责人：** 2411326-张晨旭
 
-本节由负责人补充模块设计、实现及测试记录。
+#### 4.1.1 模块功能描述
+
+实现 [trapentry.S](../code/kern/trap/trapentry.S) 中的 `.macro RESTORE_ALL` 与 `__alltraps:` 的 C 调用部分，连接统一 Trap 入口、事件处理和特权返回。调用接口为：
+
+```c
+void trap(struct trapframe *tf);
+```
+
+#### 4.1.2 关键接口与设计
+
+| 接口或数据 | 定义位置 | 设计作用 |
+| --- | --- | --- |
+| `SAVE_ALL` | `kern/trap/trapentry.S` | 保存 GPR 与 CSR，建立现场；保持已有实现不变 |
+| `RESTORE_ALL` | `kern/trap/trapentry.S` | 从现场恢复返回 CSR 和 GPR，最后恢复 sp |
+| `__alltraps`、`__trapret` | `kern/trap/trapentry.S` | 连接统一入口、C 调用和已有 sret 返回路径 |
+| `struct trapframe` | `kern/trap/trap.h` | 固定汇编与 C 共用的现场布局 |
+| `trap(struct trapframe *tf)` | `kern/trap/trap.h`、`trap.c` | 以 a0 传入现场地址，由 C 分发事件 |
+| `LOAD`、`STORE`、`REGBYTES` | `libs/riscv.h` | 使用目标架构的访存指令及寄存器宽度 |
+
+
+[trap.h](../code/kern/trap/trap.h) 的 `struct trapframe` 依次包含 `struct pushregs gpr`、`status`、`epc`、`badvaddr`、`cause`。pushregs 的字段严格按 x0～x31 排列。[riscv.h](../code/libs/riscv.h) 在 RV64 下展开 LOAD 为 ld、STORE 为 sd、REGBYTES 为 8，因而槽位 i 的字节偏移为 8i。
+
+| 槽位 | 保存内容 | 字节偏移 | 恢复说明 |
+| --- | --- | --- | --- |
+| 0 | x0 / zero | 0 | 只读零寄存器，不需恢复 |
+| 1 | x1 / ra | 8 | 被打断代码的函数返回地址 |
+| 2 | x2 / sp | 16 | 进入 Trap 前的原栈指针，最后恢复 |
+| 3～7 | gp、tp、t0～t2 | 24～56，步长 8 | 各自对应 x3～x7 |
+| 8～9 | s0～s1 | 64～72，步长 8 | 写回返回 CSR 后再恢复原值 |
+| 10～17 | a0～a7 | 80～136，步长 8 | 包括被用于传参的 a0 |
+| 18～27 | s2～s11 | 144～216，步长 8 | 各自对应 x18～x27 |
+| 28～31 | t3～t6 | 224～248，步长 8 | 各自对应 x28～x31 |
+| 32 | sstatus / status | 256 | 返回控制状态 |
+| 33 | sepc / epc | 264 | C 处理结束后的目标 PC |
+| 34 | sbadaddr（stval）/ badvaddr | 272 | 事件相关地址或信息，用于诊断 |
+| 35 | scause / cause | 280 | 完整原因值，用于分发与诊断 |
+
+SAVE_ALL 先执行 `csrw sscratch, sp` 保存原 sp，再分配 `36 * REGBYTES`。保存其他 GPR 后，`csrrw s0, sscratch, x0` 取出原 sp 并清零 sscratch，将其写入槽位 2。s0～s4 被临时用于读取 CSR 前已经保存原值，因此不会污染现场。
+
+SAVE_ALL 完成后，当前 sp 指向帧起点，槽位 2 则是原栈指针，二者不能混淆。总大小为 288 字节，且 288 % 16 = 0；只要 Trap 前 sp 已按 ABI 对齐，分配后仍满足 C 调用的 16 字节对齐。
+
+#### 4.1.3 具体实现
+
+**（1）RESTORE_ALL：返回状态与通用寄存器恢复。**
+
+恢复首先从帧中取出返回控制状态：
+
+```asm
+LOAD s0, 32*REGBYTES(sp)
+LOAD s1, 33*REGBYTES(sp)
+csrw sstatus, s0
+csrw sepc, s1
+```
+
+s0、s1 此时只作暂存，其原值仍在槽位 8、9 中，写 CSR 后再恢复，避免破坏已经恢复的寄存器。`sstatus` 决定后续特权返回的状态，`sepc` 决定返回目标；二者都使用 C 结束处理后的帧内容，尤其不能用入口时的旧 EPC 覆盖成员 C 的更新。
+
+随后源码逐项执行 `LOAD x1, 1*REGBYTES(sp)`、`LOAD x3, 3*REGBYTES(sp)`，依次至 `LOAD x31, 31*REGBYTES(sp)`，最终为：
+
+```asm
+LOAD x2, 2*REGBYTES(sp)
+```
+
+共恢复 31 个可写 GPR。x0 恒为零，不需要装载；其余寄存器均与保存槽位一致，包括 gp、tp、参数、临时及被调用者保存寄存器。最后一条 LOAD 用尚未改变的 sp 计算地址，读取槽位 2 后才写入 x2；此后不再从帧中取数，避免提前恢复 sp 导致所有剩余偏移落到错误地址。
+
+在帧未迁移、槽位未更新的原始场景中，`sp + 288` 与保存的原 sp 相等；仍选择读取槽位 2，是因为返回契约以帧内目标值为准，而不是重新推导地址。这样也保持了 sp 与其他 GPR 一致的现场恢复语义。
+
+`badvaddr` 与 `cause` 是处理和诊断输入，不是 `sret` 的返回控制依据，无需在此写回硬件。sscratch 延续 SAVE_ALL 清零后的约定。原 ra 从槽位 1 恢复，用于原代码未来的普通函数返回；本次 Trap 返回位置由 sepc 和 sret 决定。
+
+**（2）__alltraps：汇编入口与 C 调用衔接。**
+
+```asm
+__alltraps:
+    SAVE_ALL
+    mv a0, sp
+    jal trap
+
+__trapret:
+    RESTORE_ALL
+    sret
+```
+
+这是实际控制流的关键节选；宏定义及符号声明见源码。SAVE_ALL 在入口内展开，并非先调用宏再跳到 __alltraps。`mv a0, sp` 把帧地址放入 ABI 的首参数寄存器，C 可据此解释为 `struct trapframe *`。`jal trap` 改写 ra 为下一条指令地址，而原 ra 已在帧中，无需再次压栈。
+
+C ABI 只要求保留部分寄存器，不能要求 trap 自动保留所有参数和临时寄存器。这里完整现场已在调用前保存，返回路径会恢复这些寄存器，因而 C 使用它们不会永久改变被打断的 GPR 状态。C 的栈向低地址增长，遵守 ABI 时恢复调用前 sp，帧基址仍有效；函数返回后自然执行紧邻的 __trapret，无需额外跳转或使用 a0 返回值。最后由 sret 读取恢复的 sepc，并按 SPP 选择返回 S 或 U。
+
+#### 4.1.4 Spec 与 Prompt
+
+实际保存的开发 Prompt 见 [入口与上下文恢复](prompt.md#入口与上下文恢复)，包含 `[PROMPT]`、`[RELY]`、`[GUARANTEE]`、`[SPECIFICATION]` 四段。以下是对该归档和已实现行为的规格摘要，供正文审阅；属于编辑整理。
+
+```text
+[PROMPT]
+基于真实源码实现 RESTORE_ALL 和 __alltraps 的 trap(tf) 调用部分。
+先核对保存布局，再做最小修改，最后验证并如实报告执行结果。
+仅修改两处 lab3 function1 区域，保留 SAVE_ALL、__trapret 与公共接口，
+不实现 interrupt_handler 或 exception_handler，不改测试，不提交或推送。
+
+[RELY]
+RV64：LOAD=ld、STORE=sd、REGBYTES=8。
+trapframe 包含 x0～x31 及 status/epc/badvaddr/cause，大小 288 字节。
+SAVE_ALL 完成后 sp 为帧基址，槽位 2 为原 sp，sscratch 已清零。
+void trap(struct trapframe *tf) 按 RISC-V ABI 调用，可修改允许更新的现场字段。
+现有 __trapret 执行 RESTORE_ALL 后执行 sret。
+
+[GUARANTEE]
+RESTORE_ALL 恢复返回 CSR 和全部可写 GPR，最后恢复原 sp。
+__alltraps 以 a0=sp 传递现场地址并调用 trap，C 返回后保持帧基址，
+顺接 __trapret；保留 C 对 tf->epc 的修改。
+
+[SPECIFICATION]
+Pre-Condition：Trap 已路由到 S 模式，stvec 指向入口；入口栈有效且对齐；
+SAVE_ALL 建立的现场与 trap.h 一致；恢复入口处 sp 指向该现场，C 已处理完成。
+Post-Condition：trap 收到同一现场地址；正常返回后，目标 sstatus/sepc
+与现场一致，x1～x31 恢复到对应寄存器；sp 最后恢复，随后 sret 返回。
+Case 1：异步中断不调整 EPC，返回被打断的执行位置。
+Case 2：同步异常已由成员 C 调整 EPC，恢复现场中的新值。
+Case 3：C 改写 ra、参数和临时寄存器，仍从现场恢复原执行上下文。
+Case 4：恢复期间以 sp 访问现场，其他读取结束前不得改变基址。
+Requirements：逐项匹配 SAVE_ALL 偏移，使用 LOAD/REGBYTES；跳过 x0；
+临时寄存器用完后再恢复；保证调用栈对齐；不将 ra 或 C 返回值当作 EPC；
+不在汇编中自行分类事件或调整 EPC；返回级别由恢复的 SPP 决定。
+```
+
+Prompt 的设计先固定“内存布局—调用接口—允许修改范围”，再用前后置条件约束帧基址和返回状态，使 AI 不能通过改结构体或补齐他人模块来绕过接口问题。正常返回、EPC 修改和 C 寄存器变化三个 Case 分别检查事件透明性、跨模块更新和调用者保存寄存器的保护。静态布局、汇编、反汇编与联合测试分层执行，避免把语法正确当作处理器状态恢复正确。
+
+#### 4.1.5 实现及验证过程
+
+实现先核对保存布局和调用接口，再补全两处汇编填空，随后进行静态检查、独立汇编和反汇编。具体命令与输出见 5.4 节，本节概括实际过程：
+
+| 阶段 | 实现或检查内容 | 实际结果及限制 |
+| --- | --- | --- |
+| 接口梳理 | 对照 SAVE_ALL、trapframe 与 RISC-V ABI，确定槽位、帧基址和参数传递方式 | 明确 36 个槽位、288 字节帧及 sp 最后恢复的约束 |
+| 汇编实现 | 先恢复 sstatus/sepc，再恢复 GPR；入口以 a0=sp 调用 trap | 保持既有布局与返回逻辑，不扩展到成员 B/C 的处理函数 |
+| 独立验证 | C 字段偏移断言、31 个可写 GPR 恢复顺序检查、独立汇编、objdump 与差异检查 | 均有通过记录；未发现需要重写成员 A 实现的可复现功能错误 |
+| 环境修正 | 手动选择 GCC 15 时旧 CSR 别名不兼容；按 .bashrc → env.sh 加载后使用 GCC 10.2.0 | 强制重新汇编、反汇编与静态核对再次通过；属于版本选择问题 |
+| 历史构建与后续集成 | 11 月 4 日完整构建因 exception_handler 缺失而阻塞；当前源码已补齐 | 不将旧依赖错误视为当前缺陷；后续小组集成记录见第五章 |
+
+临时静态检查脚本曾因文本切片比较写错触发 AssertionError，修正检查后通过，没有因此修改内核实现。该问题与工具链兼容性、其他模块尚未完成均应区分，不能虚构为多轮汇编 Bug 修复。
+
+成员 A 的独立记录没有执行 make grade、QEMU 动态内核运行或 GDB 寄存器观察。独立验证通过的结论限定于布局、编译及指令序列；小组后续动态结果及其证据范围按第五章分别记录。
 
 ### 4.2 中断与时钟中断处理
 
@@ -406,6 +544,7 @@ void exception_handler(struct trapframe *tf) {
 中断和异常共享 Trap 入口与现场结构，但触发来源和返回语义不同。`trap_dispatch()` 利用原因值的最高位区分两类事件；时钟中断响应异步时间事件，保留原返回位置，异常处理则需要解释触发指令并确定恢复策略。这使事件分类与执行连续性形成直接联系。
 
 Trap frame 是 CPU 执行状态的软件表示，也是汇编与 C 之间的接口。保存区中的寄存器顺序、CSR 内容和原栈指针必须相互一致，处理函数才能正确读取原因，返回路径才能恢复同一执行现场。现场内存保持不变和 CPU 寄存器实际恢复是两个验证层次，需要分别检查。
+
 
 ### 6.2 特权级、中断使能与定时服务
 
