@@ -82,7 +82,7 @@ void print_regs(struct pushregs *gpr) {
     cprintf("  t6       0x%08x\n", gpr->t6);
 }
 
-//lab3 function2 YOUR CODE
+//lab3 function2 2411566 (interrupt_handler), 2413042 (exception_handler)
 void interrupt_handler(struct trapframe *tf) {
     // Remove scause's interrupt flag without changing the saved trap frame.
     uintptr_t cause = (tf->cause << 1) >> 1;
@@ -140,6 +140,29 @@ void interrupt_handler(struct trapframe *tf) {
         default:
             cprintf("Unknown interrupt: cause %llu\n",
                     (unsigned long long)cause);
+            print_trapframe(tf);
+            break;
+    }
+}
+
+/* Length of the instruction at epc: 2 bytes for RVC, 4 bytes otherwise. */
+static size_t insn_length(uintptr_t epc) {
+    uint16_t insn = *(volatile uint16_t *)epc;
+    return (insn & 0x3) == 0x3 ? 4 : 2;
+}
+
+//lab3 function2 2413042
+void exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+        case CAUSE_BREAKPOINT:
+            cprintf("Breakpoint at 0x%lx\n", tf->epc);
+            tf->epc += insn_length(tf->epc);
+            break;
+        case CAUSE_ILLEGAL_INSTRUCTION:
+            cprintf("Illegal instruction at 0x%lx\n", tf->epc);
+            tf->epc += insn_length(tf->epc);
+            break;
+        default:
             print_trapframe(tf);
             break;
     }
