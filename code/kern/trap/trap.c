@@ -6,12 +6,12 @@
 #include <memlayout.h>
 #include <mmu.h>
 #include <riscv.h>
-#include <sbi.h>
+#include <sbi.h>  // 2411566：中断处理使用的 SBI 接口。
 #include <stdio.h>
 #include <trap.h>
 
 #define TICK_NUM 100
-#define SHUTDOWN_AFTER 3
+#define SHUTDOWN_AFTER 3  // 2411566：累计输出三次时钟统计后请求关机。
 
 static void print_ticks() {
     cprintf("%d ticks\n", TICK_NUM);
@@ -168,7 +168,8 @@ void exception_handler(struct trapframe *tf) {
     }
 }
 
-static inline void trap_dispatch(struct trapframe *tf) {
+// 2411566：分发逻辑的个人学习注释。
+static inline void trap_dispatch(struct trapframe *tf) {//判断是异常还是中断的地方
     if ((intptr_t)tf->cause < 0) {
         // interrupts
         interrupt_handler(tf);

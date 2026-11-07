@@ -38,10 +38,11 @@ struct pushregs {
     uintptr_t t6;    // Temporary
 };
 
+// 2411566：Trap frame 字段的个人学习注释。
 struct trapframe {
-    struct pushregs gpr;
-    uintptr_t status;
-    uintptr_t epc;
+    struct pushregs gpr;//通用寄存器，保存ra\sp\a0等
+    uintptr_t status;//保存处理器的状态信息
+    uintptr_t epc;//保存Trap返回时使用的程序地址
     uintptr_t badvaddr;
     uintptr_t cause;
 };
