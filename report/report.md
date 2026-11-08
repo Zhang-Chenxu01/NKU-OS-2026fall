@@ -457,7 +457,7 @@ void exception_handler(struct trapframe *tf) {
 
 | Case | 行为要求 |
 | --- | --- |
-| Case 1：断点异常 | 输出 `Breakpoint at 0x<epc>`，`epc` 前进 4 字节后返回原执行流 |
+| Case 1：断点异常 | 输出 `Breakpoint at 0x<epc>`，`epc` 按实际指令长度前进后返回原执行流 |
 | Case 2：非法指令异常 | 输出 `Illegal instruction at 0x<epc>`，`epc` 按实际指令长度前进 |
 | Case 3：16 位压缩指令 | 低两位不是 `0b11`，`epc += 2` |
 | Case 4：其他异常 | 调用 `print_trapframe(tf)`，不改变、不读取 `epc` |
