@@ -24,6 +24,7 @@
 
 typedef uintptr_t pte_t;
 typedef uintptr_t pde_t;
+typedef pte_t swap_entry_t; // Lab4 virtual memory interface
 
 /* *
  * struct Page - Page descriptor structures. Each Page describes one
@@ -35,6 +36,8 @@ struct Page {
     uint64_t flags;                 // array of flags that describe the status of the page frame
     unsigned int property;          // the num of free block, used in first fit pm manager
     list_entry_t page_link;         // free list link
+    list_entry_t pra_page_link;     // reserved for page replacement
+    uintptr_t pra_vaddr;            // reserved for page replacement
 };
 
 /* Flags describing the status of a page frame */

@@ -31,6 +31,7 @@ void idt_init(void) {
     write_csr(sscratch, 0);
     /* Set the exception vector address */
     write_csr(stvec, &__alltraps);
+    set_csr(sstatus, SSTATUS_SUM); // Lab4 low-address mapping checks
 }
 
 /* trap_in_kernel - test if trap happened in kernel */

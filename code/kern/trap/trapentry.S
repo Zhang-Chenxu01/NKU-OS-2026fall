@@ -113,3 +113,9 @@ __trapret:
     RESTORE_ALL
     # return from supervisor call
     sret
+
+    .globl forkrets
+forkrets:
+    # Lab4: reuse the complete Lab3 trapframe restore path.
+    mv sp, a0
+    j __trapret

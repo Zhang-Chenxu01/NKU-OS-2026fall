@@ -9,6 +9,8 @@
 #include <string.h>
 #include <trap.h>
 #include <dtb.h>
+#include <vmm.h>
+#include <proc.h>
 
 int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
@@ -32,12 +34,13 @@ int kern_init(void) {
 
     idt_init();  // init interrupt descriptor table
 
+    vmm_init();   // Lab4 virtual memory structures
+    proc_init();  // Lab4 process table (exercise placeholder)
+
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
 
-    /* do nothing */
-    while (1)
-        ;
+    cpu_idle();   // Lab4 scheduler entry (exercise placeholder)
 }
 
 void __attribute__((noinline))
