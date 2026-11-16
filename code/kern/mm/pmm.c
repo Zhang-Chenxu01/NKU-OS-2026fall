@@ -258,16 +258,56 @@ struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
     return NULL;
 }
 
-//LAB4 function1 YOUR CODE
-// Integration placeholders only. Replace these bodies in Lab4 module 1.
+//LAB4 function1 2411326
+static void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
+{
+    if ((*ptep & PTE_V) && (*ptep & (PTE_R | PTE_W | PTE_X))) {
+        struct Page *page = pte2page(*ptep);
+        *ptep = 0;
+        // Retire the translation before returning the frame to the allocator.
+        tlb_invalidate(pgdir, la);
+        if (page_ref_dec(page) == 0) {
+            free_page(page);
+        }
+    }
+}
+
 int page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
 {
-    panic("Lab4 TODO: page_insert (module 1)");
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL) {
+        return -E_NO_MEM;
+    }
+
+    // A writable Sv39 leaf must be readable; perm=0 also needs a leaf bit.
+    if ((perm & PTE_W) || !(perm & (PTE_R | PTE_X))) {
+        perm |= PTE_R;
+    }
+
+    if (*ptep & PTE_V) {
+        // A valid non-leaf is not a managed 4KiB mapping to replace.
+        if (!(*ptep & (PTE_R | PTE_W | PTE_X))) {
+            return -E_INVAL;
+        }
+        if (pte2page(*ptep) != page) {
+            page_ref_inc(page);
+            page_remove_pte(pgdir, la, ptep);
+        }
+    } else {
+        page_ref_inc(page);
+    }
+
+    *ptep = pte_create(page2ppn(page), perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
 }
 
 void page_remove(pde_t *pgdir, uintptr_t la)
 {
-    panic("Lab4 TODO: page_remove (module 1)");
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL) {
+        page_remove_pte(pgdir, la, ptep);
+    }
 }
 
 // invalidate a TLB entry, but only if the page tables being
