@@ -177,7 +177,7 @@ void page_remove(pde_t *pgdir, uintptr_t la);
 
 **任务：**
 
-在 `E:\Operating_System\ucore\NKU-OS-2026fall-lab4` 工程中，完成 Lab4 的进程创建及初始化功能。
+在本项目 Lab4 工程中，完成 Lab4 的进程创建及初始化功能。
 
 主要修改文件：`code/kern/process/proc.c`。
 

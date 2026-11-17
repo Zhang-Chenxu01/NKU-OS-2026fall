@@ -52,7 +52,7 @@
 
 Lab4 在 Lab2 的物理页管理和 Lab3 的 Sv39 启动映射、Trap 现场保存恢复基础上，建立“内存准备—线程创建—调度执行”的完整流程。实验以统一的进程结构管理内核线程；这些线程共享内核地址空间，各自拥有 PCB、内核栈和执行上下文。
 
-下图表示各模块完成后的目标执行链，进程创建和调度部分仍需实现与集成验证：
+下图表示各模块完成后的目标执行链，完整执行链仍待集成验证：
 
 ```text
 kern_init
@@ -104,7 +104,7 @@ kern_init
 
 #### 4.1.1 模块功能描述
 
-本模块依据 [Lab4 实验指导书](<../docs/lab4 进程管理.md>)，完成 [pmm.c](../code/kern/mm/pmm.c) 中的 `page_insert()` 和 `page_remove()`，在现有 Sv39 页表框架上建立、更新和撤销 4 KiB 页映射。通过维护页表项、物理页引用计数和 TLB，使软件记录的映射关系与处理器实际使用的地址翻译保持一致，为后续内存和线程管理提供基础。
+本模块依据 Lab4 实验指导书，完成 [pmm.c](../code/kern/mm/pmm.c) 中的 `page_insert()` 和 `page_remove()`，在现有 Sv39 页表框架上建立、更新和撤销 4 KiB 页映射。通过维护页表项、物理页引用计数和 TLB，使软件记录的映射关系与处理器实际使用的地址翻译保持一致，为后续内存和线程管理提供基础。
 
 生产代码修改限于 `LAB4 function1 2411326` 区域，包括两个目标函数及新增的静态辅助函数 `page_remove_pte()`。保留 Lab2 的物理页分配器、Lab3 的启动映射及已有大页保护；对 VMM/SLOB 仅进行接口检查和运行验证。
 
@@ -225,18 +225,13 @@ void page_remove(pde_t *pgdir, uintptr_t la)
 
 **（2）构建与测试方法。** 实际环境为 Linux/Bash、SiFive GCC-Metal 10.2.0、GDB 10.1 和 QEMU 4.1.1。QEMU 配置为 `virt`、128 MiB、单 hart、`-bios default`，通过 loader 将内核镜像加载至 `0x80200000`。
 
-先运行原始自检，再在仓库外源码副本增加补充断言。原始测试文件和生产代码不包含临时插桩；构建产物与日志位于 `/tmp`。以下命令已在此前验证阶段执行，本次整理报告未重新运行测试：
+验证分为原始自检和独立源码副本中的补充断言检查。原始测试文件和生产代码不包含临时插桩；补充测试使用独立构建目录，构建产物及日志与工程源码分离保存。已执行的基础构建命令如下，在项目根目录运行：
 
 ```bash
 make -C code -j2
-make -C code -j2 OBJDIR=/tmp/lab4-pmm-3hl5rp1c/base-obj BINDIR=/tmp/lab4-pmm-3hl5rp1c/base-bin
-python3 /tmp/lab4-pmm-3hl5rp1c/run_qemu41.py baseline41
-python3 /tmp/lab4-pmm-3hl5rp1c/prepare_tests.py
-python3 /tmp/lab4-pmm-3hl5rp1c/run_qemu41.py tests41
-python3 /tmp/lab4-infra-5pkrcu3r/run.py baseline
-python3 /tmp/lab4-infra-5pkrcu3r/prepare.py
-python3 /tmp/lab4-infra-5pkrcu3r/run.py supplemental
 ```
+
+补充验证使用实验时的临时辅助脚本，分别执行页表与 VMM/SLOB 的基线检查和补充检查，具体覆盖范围及结果见下文。这些脚本未纳入仓库，因此补充测试尚不具备仅依赖本仓库的完整复现条件。本节保留已取得的实验记录。
 
 GDB 通过 `-gdb stdio` 管道连接 QEMU。原始页表验证在 `kmalloc_init()` 入口停止，两个页表自检已经完成；补充验证在 `module_tests_done()` 和 `infra_tests_done()` 停止后终止虚拟机。构建与链接均成功，没有编译警告或错误。
 
@@ -358,7 +353,7 @@ switch_to
 
 #### 4.2.4 Spec 与 Prompt
 
-完整提示词记录于 [prompt.md：Lab4 进程创建与初始化功能实现](prompt.md#lab4-process-create-2411566)，原文来自本人记录的 `D:\操作系统\实验\lab4\prompt.txt`。提示词采用课程要求的四段式结构，先界定六个函数和代码修改边界，再列出实际依赖、必须保持的接口以及可检查的前置条件、后置条件和分支情形。
+完整提示词记录于 [prompt.md：Lab4 进程创建与初始化功能实现](prompt.md#lab4-process-create-2411566)。提示词采用课程要求的四段式结构，先界定六个函数和代码修改边界，再列出实际依赖、必须保持的接口以及可检查的前置条件、后置条件和分支情形。
 
 | 提示词部分 | 设计内容及实现对应 |
 | --- | --- |
@@ -383,9 +378,9 @@ switch_to
 make -j2
 ```
 
-编译、链接及 `bin/ucore.img` 生成完成，构建日志中没有编译警告或错误。本节整理沿用本次实现阶段已经取得的构建和运行记录。
+编译、链接及 `bin/ucore.img` 生成完成，构建日志中没有编译警告或错误。本节测试结果依据实现阶段保存的构建和运行记录。
 
-**（3）进程创建专项运行。** 使用仓库原有的注入工具，在仓库外的临时源码副本中挂接原有 `test_lab4_process_create()`，并在副本中统一文本换行格式；原仓库的测试文件及评分脚本保持原样。构建副本内核后，使用 QEMU 4.1.1 的 `virt` 机器直接运行：
+**（3）进程创建专项运行。** 使用[仓库原有的测试注入工具](../code/tools/inject.py)，在独立测试源码副本中插入[原有进程创建用例](../code/tools/test_lab4.c) `test_lab4_process_create()` 的调用，并在副本中统一文本换行格式；原仓库的测试文件及评分脚本保持原样。构建副本内核后，在该副本的 `code` 目录使用 QEMU 4.1.1 的 `virt` 机器直接运行：
 
 ```bash
 timeout 6s qemu-system-riscv64 \
@@ -404,7 +399,7 @@ timeout 6s qemu-system-riscv64 \
 | --- | --- | --- |
 | 构建和链接 | `make -j2` | 通过，生成内核及镜像，无编译警告或错误 |
 | 当前进程和空闲进程 | 原有断言检查 `current == idleproc`、PID 0、可运行状态、复用 `bootstack` | 通过 |
-| 空闲进程初始字段 | 原有断言检查 `parent/mm/tf == NULL`、`runs/flags/context.ra == 0` | 通过 |
+| 空闲进程初始字段 | 原有断言检查 `parent`、`mm`、`tf` 均为 `NULL`，`runs`、`flags`、`context.ra` 均为 `0` | 通过 |
 | 初始内核线程 | 原有断言检查 `initproc != NULL`、PID 1、可运行状态、父进程为 `idleproc`、`mm == NULL` | 通过 |
 | 初始上下文入口 | 原有断言检查 `initproc->context.ra`、`context.sp` 非零 | 通过 |
 | 初始化计数 | `proc_init()` 中的 `assert(nr_process == 2)` | 通过 |
@@ -415,7 +410,7 @@ timeout 6s qemu-system-riscv64 \
 
 **（4）实现中处理的关键问题。** 首先，不能直接把创建接口传入的零栈地址写回新线程，否则 Trap 返回会恢复无效 `sp`，因此 `copy_thread()` 将其转换为新内核栈中 Trap frame 的地址。其次，context 与 Trap frame 的入口作用不同，需要同时设置 `context.ra/sp` 和 `tf.epc/s0/s1/status`，并与已有汇编保持一致。最后，PCB 和栈的资源归属不同，失败回收必须依据已经完成的分配步骤执行；启动栈和共享启动页表不属于新线程的独占分配资源，不能纳入该回收路径。
 
-### 4.3 异常处理
+### 4.3 进程调度与上下文切换
 
 **负责人：** 2413042-郭桦
 
