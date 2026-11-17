@@ -218,36 +218,132 @@ init_main(void *arg)
     return 0;
 }
 
-//LAB4 function2 YOUR CODE
-// Integration placeholders only; all process creation is still an exercise.
+//LAB4 function2 2411566
 static struct proc_struct *alloc_proc(void)
 {
-    panic("Lab4 TODO: alloc_proc (module 2)");
+    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+    if (proc != NULL)
+    {
+        // Clear counters, pointers, flags, name and the saved context.
+        memset(proc, 0, sizeof(struct proc_struct));
+        proc->state = PROC_UNINIT;
+        proc->pid = -1;
+        proc->pgdir = boot_pgdir_pa;
+        list_init(&(proc->list_link));
+        list_init(&(proc->hash_link));
+    }
+    return proc;
 }
 
 static int copy_mm(uint32_t clone_flags, struct proc_struct *proc)
 {
-    panic("Lab4 TODO: copy_mm (module 2)");
+    // Lab4 kernel threads use the boot page table without owning an mm.
+    (void)clone_flags;
+    if (current->mm != NULL)
+    {
+        return -E_INVAL;
+    }
+    proc->mm = NULL;
+    return 0;
 }
 
 static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
 {
-    panic("Lab4 TODO: copy_thread (module 2)");
+    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE - sizeof(struct trapframe));
+    *(proc->tf) = *tf;
+    proc->tf->gpr.a0 = 0;
+    // A kernel thread has no supplied stack: start below its saved frame.
+    proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)(proc->tf) : esp;
+    proc->context.ra = (uintptr_t)forkret;
+    proc->context.sp = (uintptr_t)(proc->tf);
 }
 
 int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
 {
-    panic("Lab4 TODO: do_fork (module 2)");
+    if (nr_process >= MAX_PROCESS)
+    {
+        return -E_NO_FREE_PROC;
+    }
+
+    int ret = -E_NO_MEM;
+    struct proc_struct *proc = alloc_proc();
+    if (proc == NULL)
+    {
+        return ret;
+    }
+    proc->parent = current;
+
+    if ((ret = setup_kstack(proc)) != 0)
+    {
+        goto bad_proc;
+    }
+    if ((ret = copy_mm(clone_flags, proc)) != 0)
+    {
+        goto bad_kstack;
+    }
+    copy_thread(proc, stack, tf);
+
+    // Publish only a fully initialized thread, with a unique PID.
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    proc->pid = get_pid();
+    hash_proc(proc);
+    list_add(&proc_list, &(proc->list_link));
+    nr_process++;
+    wakeup_proc(proc);
+    ret = proc->pid;
+    local_intr_restore(intr_flag);
+    return ret;
+
+bad_kstack:
+    put_kstack(proc);
+bad_proc:
+    kfree(proc);
+    return ret;
 }
 
 int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
 {
-    panic("Lab4 TODO: kernel_thread (module 2)");
+    struct trapframe tf;
+    memset(&tf, 0, sizeof(struct trapframe));
+    // kernel_thread_entry loads a0 from s1 and calls the function in s0.
+    tf.gpr.s0 = (uintptr_t)fn;
+    tf.gpr.s1 = (uintptr_t)arg;
+    tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
+    tf.epc = (uintptr_t)kernel_thread_entry;
+    return do_fork(clone_flags | CLONE_VM, 0, &tf);
 }
 
 void proc_init(void)
 {
-    panic("Lab4 TODO: proc_init (module 2)");
+    list_init(&proc_list);
+    for (int i = 0; i < HASH_LIST_SIZE; i++)
+    {
+        list_init(hash_list + i);
+    }
+
+    if ((idleproc = alloc_proc()) == NULL)
+    {
+        panic("proc_init: cannot allocate idleproc.\n");
+    }
+    idleproc->pid = 0;
+    idleproc->state = PROC_RUNNABLE;
+    idleproc->kstack = (uintptr_t)bootstack;
+    idleproc->need_resched = 1;
+    set_proc_name(idleproc, "idle");
+    current = idleproc;
+    // PID 0 is counted but stays outside the schedulable process list.
+    nr_process = 1;
+
+    int pid = kernel_thread(init_main, "Hello world!!", 0);
+    if (pid <= 0)
+    {
+        panic("proc_init: cannot create initproc (%d).\n", pid);
+    }
+    initproc = find_proc(pid);
+    assert(initproc != NULL && initproc->pid == 1);
+    set_proc_name(initproc, "init");
+    assert(nr_process == 2);
 }
 
 

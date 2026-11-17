@@ -293,19 +293,127 @@ MODULE_A_ALL_PASS
 
 ---
 
-### 4.2 中断与时钟中断处理
+### 4.2 进程创建与初始化
 
 **负责人：** 2411566-罗晟皓
 
 #### 4.2.1 模块功能描述
 
+本模块实现 [proc.c](../code/kern/process/proc.c) 中的 `alloc_proc()`、`proc_init()`、`kernel_thread()`、`do_fork()`、`copy_thread()` 和 `copy_mm()`，把内核中的目标函数及参数组织为具有独立 PCB、内核栈和初始执行现场的内核线程。初始化后，当前启动执行流对应 `idleproc`，新建线程 `initproc` 处于 `PROC_RUNNABLE` 状态，供后续调度使用。
+
+代码修改限于 `//LAB4 function2 2411566` 区域，保持现有函数签名以及 PCB、context、Trap frame 的布局。当前 Lab4 内核线程共用启动页表，不创建或复制用户地址空间。
+
 #### 4.2.2 关键接口与设计
+
+| 数据结构或接口 | 定义位置 | 本模块中的作用 |
+| --- | --- | --- |
+| `struct proc_struct` | `proc.h` | 记录状态、PID、运行次数、内核栈、调度标志、父进程、内存管理指针、context、Trap frame、页表物理地址、名称和链表节点 |
+| `struct context` | `proc.h` | 保存 `ra`、`sp` 和 `s0～s11`；新线程首次切换的 `ra` 指向 `forkret` |
+| `struct trapframe` | `trap.h` | 保存通用寄存器、`status`、`epc` 等信息，经现有 Trap 返回路径恢复 |
+| `proc_list`、`hash_list`、`nr_process` | `proc.c` | 维护线程集合、PID 查询和进程数量；PID 0 计入数量，但不加入普通进程链表和 PID 哈希表 |
+| `kmalloc()`、`kfree()` | `kmalloc.c` | 分配和回收 PCB |
+| `setup_kstack()`、`put_kstack()` | `proc.c` | 通过物理页接口分配和释放 `KSTACKPAGE` 页内核栈 |
+| `get_pid()`、`hash_proc()`、`find_proc()` | `proc.c` | 分配唯一 PID、登记哈希节点以及按 PID 查找线程 |
+| `boot_pgdir_pa`、`bootstack` | `pmm.h` 声明 | 分别用于设置内核页表根的物理地址和复用启动栈 |
+| `wakeup_proc()` | `sched.c` | 将初始化完毕的线程从 `PROC_UNINIT` 转为 `PROC_RUNNABLE` |
+| `local_intr_save/restore()` | `sync.h` | 保护 PID 分配、链表登记、计数更新和线程唤醒，并恢复进入临界区前的中断状态 |
+
+这里需要区分两类现场：context 用于线程之间的上下文切换，Trap frame 用于恢复线程开始执行时的寄存器及状态。新线程没有已有调用现场可恢复，因此需要人为设置两者，使 context 先进入 `forkret`，再通过 Trap frame 到达 `kernel_thread_entry`。
 
 #### 4.2.3 具体实现
 
+**（1）`alloc_proc()`：建立 PCB 初值。** 使用 `kmalloc()` 分配 PCB，失败返回 `NULL`。成功后将整个结构清零，因此运行次数、内核栈、调度标志、父进程、`mm`、Trap frame、flags、名称及 context 均取得明确初值；再设置 `state = PROC_UNINIT`、`pid = -1`、`pgdir = boot_pgdir_pa`，并分别调用 `list_init()` 初始化进程链表和哈希链表节点。链表节点需要自指，不能仅依靠清零完成初始化。
+
+**（2）`copy_mm()`：处理本阶段的地址空间约定。** 当 `current->mm == NULL` 时，设置 `proc->mm = NULL` 并返回 `0`。线程的 `pgdir` 已在 PCB 初始化时设置为启动页表物理地址。当父进程具有非空 `mm` 时返回 `-E_INVAL`，交给调用方清理已分配资源；本模块不接管或释放父进程的地址空间，也不实现用户地址空间复制。
+
+**（3）`copy_thread()`：布置首次执行现场。** 在新内核栈顶部预留 `sizeof(struct trapframe)` 字节，将输入 Trap frame 复制到该位置，令 `proc->tf` 指向它，并将子线程返回值寄存器 `a0` 置为 `0`。如果传入的 `esp` 为 `0`，将恢复后的 `sp` 设置为该 Trap frame 的地址，使函数调用向低地址使用新线程自己的内核栈；否则使用传入的栈地址。最后设置 `context.ra = forkret`、`context.sp = proc->tf`，其他 context 寄存器保留 PCB 分配时的零值。
+
+按现有汇编接口，初始现场应衔接如下路径：
+
+```text
+switch_to
+    → forkret
+    → forkrets(current->tf)
+    → __trapret：恢复 Trap frame，执行 sret
+    → kernel_thread_entry：a0 ← s1，调用 s0 指向的函数
+    → 目标线程函数
+```
+
+**（4）`do_fork()`：组织创建过程与失败回收。** 首先检查 `nr_process`，达到 `MAX_PROCESS` 时返回 `-E_NO_FREE_PROC`。随后依次分配 PCB、设置 `parent = current`、分配内核栈、调用 `copy_mm()` 和 `copy_thread()`。只有对象及现场准备完毕后，才进入中断保护区，分配 PID、加入 PID 哈希表和 `proc_list`、增加 `nr_process`，并通过 `wakeup_proc()` 将线程设为可运行，最后恢复原中断状态并返回 PID。
+
+| 失败位置 | 返回及资源处理 |
+| --- | --- |
+| 进程数量达到上限 | 返回 `-E_NO_FREE_PROC`，不分配资源 |
+| PCB 分配失败 | 返回 `-E_NO_MEM`，不访问空指针 |
+| 内核栈分配失败 | 跳转 `bad_proc`，仅释放已经分配的 PCB |
+| `copy_mm()` 失败 | 先经 `bad_kstack` 释放新内核栈，再释放 PCB，返回原错误码 |
+
+失败分支均发生在 PID 和链表登记之前，因此不需要撤销进程记录，也不会错误增加进程数量。当前 `copy_mm()` 不分配任何 `mm` 资源，失败清理不涉及共享启动页表或父进程地址空间。
+
+**（5）`kernel_thread()`：将目标函数转换为线程入口现场。** 清零栈上的临时 Trap frame，按 `kernel_thread_entry` 的现有约定将函数指针存入 `s0`、参数存入 `s1`，并将 `epc` 指向该汇编入口。状态值以当前 `sstatus` 为基础，设置 `SSTATUS_SPP` 和 `SSTATUS_SPIE`、清除 `SSTATUS_SIE`，使 Trap 恢复期间保持关闭中断，并在 `sret` 后以 S 模式和预置的中断状态开始执行。随后调用 `do_fork(clone_flags | CLONE_VM, 0, &tf)`，由创建路径复制临时现场并分配实际线程栈。
+
+**（6）`proc_init()`：建立两个初始进程。** 初始化进程链表和全部 PID 哈希桶后，分配 `idleproc`，设置 PID 为 `0`、状态为 `PROC_RUNNABLE`、内核栈为既有 `bootstack`、`need_resched = 1`、名称为 `idle`，并设置 `current = idleproc`、`nr_process = 1`。此处不为启动执行流重复申请内核栈。
+
+然后通过 `kernel_thread(init_main, "Hello world!!", 0)` 创建第二个线程；检查创建返回值，按 PID 查得 `initproc`，确认其 PID 为 `1`，设置名称为 `init`，并断言总进程数为 `2`。PCB 或初始线程创建失败时输出明确的初始化错误信息。
+
 #### 4.2.4 Spec 与 Prompt
 
+完整提示词记录于 [prompt.md：Lab4 进程创建与初始化功能实现](prompt.md#lab4-process-create-2411566)，原文来自本人记录的 `D:\操作系统\实验\lab4\prompt.txt`。提示词采用课程要求的四段式结构，先界定六个函数和代码修改边界，再列出实际依赖、必须保持的接口以及可检查的前置条件、后置条件和分支情形。
+
+| 提示词部分 | 设计内容及实现对应 |
+| --- | --- |
+| `[PROMPT]` | 明确创建 `idleproc`、`initproc` 的目标，限定修改 `proc.c` 的 function2 区域，保留他人实现和既有结构布局 |
+| `[RELY]` | 列出 PCB、context、Trap frame、全局变量、内存分配、PID、链表、中断及状态位接口，要求先核对真实源码 |
+| `[GUARANTEE]` | 固定六个目标函数的签名，要求实现真实功能并移除对应的占位 panic |
+| `[SPECIFICATION]` | 按函数给出 Pre-Condition、Post-Condition 和 Cases，覆盖初始化、入口寄存器、栈地址、状态位、线程登记及失败回收 |
+
+**Pre-Condition：** 物理内存、启动页表和动态内存分配器已初始化；创建线程时 `current` 有效，输入目标函数、参数和 Trap frame 满足对应接口约定。
+
+**Post-Condition：** PCB 字段初值明确，新内核线程拥有有效的内核栈和初始现场；成功创建后具有唯一 PID、正确父进程和可运行状态；失败时清理本次已取得的资源，不留下无效登记。进程管理初始化结束后，`current == idleproc`，`initproc->parent == idleproc`，两个初始进程的 PID 分别为 `0` 和 `1`。
+
+规格中的关键 Cases 是：PCB 分配失败、进程数量达到上限、内核栈分配失败、内存管理处理失败、`esp == 0` 的内核线程现场，以及 PID 和链表登记的中断保护。这些约束分别对应返回错误、按逆序清理资源、设置有效栈指针和只公开完整线程的实现逻辑。
+
 #### 4.2.5 实现及验证过程
+
+**（1）源码核对与实现。** 实现前检查了 `proc.c`、`proc.h`、`trap.h`、`entry.S`、`trapentry.S`、`sync.h`、`pmm.h`、`kmalloc.c` 以及原有进程创建测试，确认寄存器字段、内核栈分配接口、PID 规则及 Trap 返回约定。六个目标函数原先均通过 `Lab4 TODO` panic 占位，本次在指定区域完成实现，并将该区域的 `YOUR CODE` 替换为学号 `2411566`。
+
+**（2）构建验证。** 在 WSL Ubuntu 22.04 中使用 `riscv64-unknown-elf-gcc` 10.2.0，进入工程的 `code` 目录运行：
+
+```bash
+make -j2
+```
+
+编译、链接及 `bin/ucore.img` 生成完成，构建日志中没有编译警告或错误。本节整理沿用本次实现阶段已经取得的构建和运行记录。
+
+**（3）进程创建专项运行。** 使用仓库原有的注入工具，在仓库外的临时源码副本中挂接原有 `test_lab4_process_create()`，并在副本中统一文本换行格式；原仓库的测试文件及评分脚本保持原样。构建副本内核后，使用 QEMU 4.1.1 的 `virt` 机器直接运行：
+
+```bash
+timeout 6s qemu-system-riscv64 \
+    -machine virt -nographic -bios default \
+    -device loader,file=bin/ucore.img,addr=0x80200000 \
+    -monitor none
+```
+
+`test_lab4_process_create()` 在 `proc_init()` 结束位置执行。实际串口输出包含：
+
+```text
+[Test Process Create] PASS
+```
+
+| 检查项 | 检查方式 | 实际结果 |
+| --- | --- | --- |
+| 构建和链接 | `make -j2` | 通过，生成内核及镜像，无编译警告或错误 |
+| 当前进程和空闲进程 | 原有断言检查 `current == idleproc`、PID 0、可运行状态、复用 `bootstack` | 通过 |
+| 空闲进程初始字段 | 原有断言检查 `parent/mm/tf == NULL`、`runs/flags/context.ra == 0` | 通过 |
+| 初始内核线程 | 原有断言检查 `initproc != NULL`、PID 1、可运行状态、父进程为 `idleproc`、`mm == NULL` | 通过 |
+| 初始上下文入口 | 原有断言检查 `initproc->context.ra`、`context.sp` 非零 | 通过 |
+| 初始化计数 | `proc_init()` 中的 `assert(nr_process == 2)` | 通过 |
+| 资源分配失败清理 | 按代码路径检查错误码、栈和 PCB 的释放顺序及登记时机 | 路径已核对；本次未进行资源不足故障注入 |
+| 修改范围与占位检查 | `git diff --check`、差异范围核对及 function2 区域检查 | 通过，无本模块遗留 TODO panic，区域外代码保持原样 |
+
+进程创建用例验证的是初始化后的对象状态，以及 context 入口和栈指针已设置；该 PASS 不能单独证明整个首次切换和目标函数执行链已经运行通过。
+
+**（4）实现中处理的关键问题。** 首先，不能直接把创建接口传入的零栈地址写回新线程，否则 Trap 返回会恢复无效 `sp`，因此 `copy_thread()` 将其转换为新内核栈中 Trap frame 的地址。其次，context 与 Trap frame 的入口作用不同，需要同时设置 `context.ra/sp` 和 `tf.epc/s0/s1/status`，并与已有汇编保持一致。最后，PCB 和栈的资源归属不同，失败回收必须依据已经完成的分配步骤执行；启动栈和共享启动页表不属于新线程的独占分配资源，不能纳入该回收路径。
 
 ### 4.3 异常处理
 
