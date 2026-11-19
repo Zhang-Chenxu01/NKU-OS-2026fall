@@ -421,3 +421,181 @@ static int copy_mm(uint32_t clone_flags,
 最后简要汇报实际修改文件、六个函数的实现情况、测试结果和遗留问题。
 
 **本轮只完成上述进程创建与初始化功能，不扩展任务范围，也不进行 Git 提交或推送。**
+
+# Lab4：进程调度与上下文切换实现
+
+## [PROMPT]
+
+**任务：**
+
+在本项目 Lab4 工程中，完成 Lab4 的进程调度与上下文切换功能。
+
+主要修改文件：
+
+- `code/kern/schedule/sched.c`
+- `code/kern/process/proc.c`（仅功能模块三区域）
+- `code/kern/process/switch.S`
+
+需要实现四个函数：
+
+- `cpu_idle()`
+- `schedule()`
+- `proc_run()`
+- `switch_to()`
+
+最终目标是让 `idleproc` 在 `kern_init()` 末尾主动让出 CPU，调度器选中 `initproc` 后完成页表与寄存器现场切换，使新线程能够首次运行并进入 `init_main`；后续测试线程也能够在 `schedule()` 与 `switch_to()` 之间反复切换。
+
+**操作要求：**
+
+1. 首先检查工程中 `sched.c`、`proc.c`、`switch.S`、`proc.h`、`trap.h`、`trapentry.S`、`process/entry.S` 及测试代码的真实实现，确认接口与依赖。
+2. 只修改 `//LAB4 function3 YOUR CODE` 对应的三处区域；不得改动 `//LAB4 function1`（虚拟内存页操作）和 `//LAB4 function2`（进程创建）的代码。
+3. 不修改 `struct proc_struct`、`struct context`、`struct trapframe` 的现有布局，不改变 `forkret → forkrets → __trapret` 的既有恢复链路。
+4. 不修改 `pmm.c`、`entry.S`、`trapentry.S`、`tools/` 下的测试与评分脚本。
+5. 保留 `lab4` 注释，将本区域的 `YOUR CODE` 替换为学号 `2413042`。
+6. 不引入时间片、优先级、抢占式调度等本实验之外的功能；调度点仍只保留在 `cpu_idle()` 中。
+7. 临界区必须使用现有 `local_intr_save()` / `local_intr_restore()`，并恢复进入前的中断状态。
+8. 不擅自执行 Git 提交、推送、合并或重置操作，保留工作区已有修改。
+
+**输出要求：**
+
+直接修改实际代码文件。完成后简要说明四个函数的实现要点、关键寄存器与页表操作、编译及运行验证结果，以及尚未解决的问题。
+
+## [RELY]
+
+以下是实现所依赖的现有数据结构和接口，使用时必须与项目中的实际定义保持一致。
+
+**1. 核心数据结构**
+
+`struct proc_struct`：进程控制块，本模块主要使用：
+
+- `state`：`PROC_RUNNABLE` 等状态
+- `need_resched`：调度请求标志
+- `runs`：运行次数
+- `kstack`：内核栈地址
+- `pgdir`：页表根节点物理地址
+- `context`：线程切换上下文
+- `list_link`：进程链表节点
+
+`struct context`：保存 `ra`、`sp`、`s0～s11`，用于线程上下文切换。
+
+`struct trapframe`：保存通用寄存器和 `status`、`epc`，由 `__trapret` 恢复。
+
+**2. 全局变量**
+
+- `proc_list`、`current`、`idleproc`、`initproc`
+- `boot_pgdir_pa`、`bootstack`
+
+**3. 可使用的函数和宏**
+
+- 调度与切换：`switch_to()`、`proc_run()`
+- 进程状态：`PROC_RUNNABLE`、`PROC_SLEEPING`、`PROC_ZOMBIE`
+- 链表管理：`list_next()`、`le2proc()`、`list_entry_t`
+- 中断保护：`local_intr_save()`、`local_intr_restore()`、`intr_enable()`、`intr_disable()`
+- 寄存器操作：`read_csr()`、`write_csr()`、`SSTATUS_SIE`
+- 页表与 TLB：`RISCV_PGSHIFT`、`flush_tlb()`
+- 首次运行链路：`forkret()`、`forkrets()`、`__trapret`、`kernel_thread_entry`
+- 断言：`assert()`
+
+不得自行创建与现有接口重复的函数或宏，也不得修改 `context` 的字段顺序。
+
+## [GUARANTEE]
+
+必须实现以下四个函数，保持函数签名不变：
+
+```c
+void cpu_idle(void) __attribute__((noreturn));
+
+void schedule(void);
+
+void proc_run(struct proc_struct *proc);
+
+void switch_to(struct context *from, struct context *to);
+```
+
+`switch_to()` 必须按 `ra`、`sp`、`s0～s11` 的顺序保存旧 context、恢复新 context；`proc_run()` 必须按 Sv39 格式写 `satp`；`schedule()` 必须处理“没有其他就绪线程”的情况；`cpu_idle()` 必须持续运行不返回。
+
+所有函数必须实现真实功能，不允许保留原有 `Lab4 TODO` panic、空循环或占位跳转绕过测试。
+
+## [SPECIFICATION]
+
+### 1. cpu_idle()：空闲线程主循环
+
+**Pre-Condition：**
+
+`current` 指向有效 PCB；`kern_init()` 已完成进程管理初始化；调度点位于该循环内。
+
+**Post-Condition：**
+
+函数不返回；每次发现 `current->need_resched` 非零时调用 `schedule()`。
+
+**Cases：**
+
+- `need_resched == 0`：继续循环，不调用调度器。
+- `need_resched != 0`：调用一次 `schedule()`，由其清除标志并可能切换线程。
+- 不主动设置 `need_resched`，不引入时钟抢占。
+
+### 2. schedule()：选择下一个可运行线程
+
+**Pre-Condition：**
+
+`current`、`idleproc` 有效；`proc_list` 已初始化；可在任意线程上下文调用。
+
+**Post-Condition：**
+
+`current->need_resched` 被清零；若存在其他 `PROC_RUNNABLE` 线程则切换到该线程，否则保持或回到 `idleproc`；被选中线程的 `runs` 增加；退出时恢复原中断状态。
+
+**Cases：**
+
+- `current == idleproc`：从 `proc_list` 表头开始扫描。
+- `current` 为普通线程：从当前线程的 `list_link` 之后开始扫描，实现轮转。
+- 扫描时跳过链表头哨兵，遇到第一个 `PROC_RUNNABLE` 即停止。
+- 整圈未找到：回退到 `idleproc`。
+- `next == current`：不调用 `proc_run()`。
+- 全程处于关闭中断的临界区。
+
+### 3. proc_run()：切换线程与页表
+
+**Pre-Condition：**
+
+`proc` 指向已初始化且处于可运行状态的 PCB；`proc->pgdir` 是页表根物理地址；`proc->context` 已按布局初始化。
+
+**Post-Condition：**
+
+`current == proc`；`satp` 的 MODE=8、PPN=`proc->pgdir >> 12`；TLB 已刷新；`switch_to()` 后执行流位于目标线程现场；中断状态恢复到进入临界区前。
+
+**Cases：**
+
+- `proc == current`：直接返回，不做切换。
+- 目标与当前共享启动页表：`satp` 数值相同，仍执行刷新以保持一致性。
+- 目标为新线程：`context.ra = forkret`，经 `forkrets → __trapret → kernel_thread_entry` 进入目标函数。
+- 切换过程中不得被中断打断。
+
+### 4. switch_to()：保存与恢复上下文
+
+**Pre-Condition：**
+
+`from`、`to` 指向有效的 `struct context`；调用发生在内核栈上。
+
+**Post-Condition：**
+
+旧线程的 `ra/sp/s0～s11` 已写入 `from`，CPU 寄存器已从 `to` 恢复；`ret` 返回到 `to->ra` 指向的位置。
+
+**Cases：**
+
+- 普通线程切换：返回到对方上次 `switch_to()` 之后，即 `proc_run()` 中的下一条语句。
+- 新线程首次切换：`to->ra == forkret`，返回到 `forkret`。
+- 寄存器偏移必须与 `struct context` 的字段顺序一致，不得增删字段。
+
+## 验证与交付要求
+
+1. 确认四个函数全部完成，不存在本模块遗留的 TODO panic 或占位实现。
+2. 检查 `schedule()` 的扫描起点、链表头哨兵处理、`idleproc` 兜底与中断恢复。
+3. 检查 `proc_run()` 的 `satp` 编码、TLB 刷新与 `current` 更新顺序。
+4. 检查 `switch_to()` 的寄存器偏移与 `ra/sp/s0～s11` 覆盖是否完整。
+5. 运行 `make` 完成编译和链接检查。
+6. 运行 `make grade`，确认 `[Test Schedule] PASS` 以及 `initproc` 的三行输出。
+7. 不修改评分脚本和测试代码来规避失败；若其他模块阻塞整体运行，应明确指出阻塞原因。
+8. 最后简要汇报实际修改文件、四个函数的实现情况、测试结果和遗留问题。
+
+**本轮只完成上述调度与上下文切换功能，不扩展任务范围，也不进行 Git 提交或推送。**
+

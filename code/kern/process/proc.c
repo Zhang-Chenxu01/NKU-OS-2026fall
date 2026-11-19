@@ -347,19 +347,39 @@ void proc_init(void)
 }
 
 
-//LAB4 function3 YOUR CODE
+//LAB4 function3 2413042
 void proc_run(struct proc_struct *proc)
 {
-    panic("Lab4 TODO: proc_run (module 3)");
+    if (proc != current)
+    {
+        bool intr_flag;
+        struct proc_struct *prev = current;
+        local_intr_save(intr_flag);
+        {
+            current = proc;
+
+            // Sv39: MODE=8 in satp[63:60], PPN = physical address of the root table >> 12.
+            // lsatp()/lcr3() are Sv32-era helpers and cannot encode the mode field,
+            // so build the register value here (same encoding as kern_entry).
+            uintptr_t satp = (8UL << 60) |
+                             ((proc->pgdir >> RISCV_PGSHIFT) & ((1UL << 44) - 1));
+            write_csr(satp, satp);
+            flush_tlb();
+
+            switch_to(&(prev->context), &(proc->context));
+        }
+        local_intr_restore(intr_flag);
+    }
 }
 
 void cpu_idle(void)
 {
-    panic("Lab4 TODO: cpu_idle (module 3)");
-}
-
-// Called only by the assembly placeholder; remove when implementing switch_to.
-void switch_to_unimplemented(void)
-{
-    panic("Lab4 TODO: switch_to (module 3)");
+    while (1)
+    {
+        // The only scheduling point of lab4: give up the CPU on request.
+        if (current->need_resched)
+        {
+            schedule();
+        }
+    }
 }
