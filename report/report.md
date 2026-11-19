@@ -6,7 +6,7 @@
 | --- | --- |
 | **实验名称** | Lab4：进程管理 |
 | **小组成员** | 2411326-张晨旭、2411566-罗晟皓、2413042-郭桦 |
-| **完成日期** | 待最终集成完成后填写 |
+| **完成日期** | 2026-11-19 |
 
 ### 小组分工
 
@@ -416,22 +416,282 @@ timeout 6s qemu-system-riscv64 \
 
 #### 4.3.1 模块功能描述
 
+本模块实现 [sched.c](../code/kern/schedule/sched.c) 中的 `schedule()`、[proc.c](../code/kern/process/proc.c) 中的 `proc_run()` 与 `cpu_idle()`，以及 [switch.S](../code/kern/process/switch.S) 中的 `switch_to()`，把模块二创建好的内核线程真正交给 CPU 执行。
+
+Lab4 的调度点唯一，位于空闲线程 `cpu_idle()` 的循环中：当 `current->need_resched` 被置位时，`schedule()` 从 `proc_list` 中选出一个 `PROC_RUNNABLE` 状态的线程，`proc_run()` 更新 `current`、切换到目标页表，并调用 `switch_to()` 保存旧线程的执行现场、恢复新线程的执行现场。
+
+调度策略为最简单的 FIFO/轮转：以当前线程为起点向后扫描 `proc_list`，跳过链表头哨兵；`idleproc` 不加入 `proc_list`，在没有其他就绪线程时作为兜底。本实验不实现时间片、优先级和抢占式调度，这些内容留给后续实验。
+
+本模块不修改 PCB、context、Trap frame 的布局，也不改变 `forkret → forkrets → __trapret` 的既有恢复链路；代码修改限于 `//LAB4 function3 2413042` 区域。
+
 #### 4.3.2 关键接口与设计
+
+| 数据结构或接口 | 定义位置 | 本模块中的作用 |
+| --- | --- | --- |
+| `struct proc_struct` | `proc.h` | 通过 `state`、`need_resched`、`runs`、`pgdir`、`context` 判断和切换线程 |
+| `struct context` | `proc.h` | `switch_to()` 保存/恢复的 `ra`、`sp`、`s0～s11`；新线程的 `ra` 指向 `forkret` |
+| `proc_list`、`current`、`idleproc` | `proc.c` | 就绪队列、当前线程和空闲线程；`idleproc` 不进入 `proc_list`，仅作兜底 |
+| `cpu_idle()` | `proc.c` | 唯一调度点：循环检查 `need_resched` 并调用 `schedule()` |
+| `schedule()` | `sched.c` | 在临界区内选择下一个可运行线程，必要时调用 `proc_run()` |
+| `proc_run()` | `proc.c` | 更新 `current`、按 Sv39 写 `satp`、刷新 TLB、调用 `switch_to()` |
+| `switch_to()` | `switch.S` | 保存旧 context、恢复新 context，并返回到新线程的执行现场 |
+| `local_intr_save/restore()` | `sync.h` | 使“选择 + 切换”整体原子，退出时恢复进入前的中断状态 |
+| `read_csr/write_csr(satp)`、`RISCV_PGSHIFT` | `riscv.h` | 构造 Sv39 的 satp 值：MODE=8，PPN=`pgdir >> 12` |
+| `flush_tlb()` | `pmm.c`、`pmm.h` | 切换页表后失效旧地址翻译 |
+| `forkret()`、`forkrets()`、`__trapret`、`kernel_thread_entry` | `proc.c`、`trapentry.S`、`process/entry.S` | 新线程首次运行的恢复链路 |
+| `boot_pgdir_pa` | `pmm.h` | 内核线程共享的启动页表根物理地址，写入 `satp` 的 PPN |
+
+设计上有三个必须同时保持一致的状态：`current` 指针、`satp` 指向的页表，以及 CPU 中实际保存的寄存器现场。若先改 `current` 再切换现场，或先写 `satp` 再切换栈，任何一次中断都可能让三者不一致，因此 `proc_run()` 在关中断的临界区内依次完成这三步。
+
+`satp` 不能直接复用 `lcr3()`：该函数按 Sv32 语义只写入 PPN，不带 MODE 字段；本实验需要 Sv39 的 `MODE=8`，因此按 `kern_entry` 的写法显式构造 `(8UL << 60) | (pgdir >> 12)`，其中 `pgdir` 是页表根的物理地址。
+
+`switch_to()` 只处理被调用者保存寄存器，原因是它本身是一个函数调用：调用者保存寄存器由编译器在调用点负责，而 `ra` 决定返回地址，`sp` 决定新线程使用哪个内核栈，`s0～s11` 是跨调用需要保持的寄存器。改变 `context` 的字段顺序或数量会破坏这条约定，因此实现中严格沿用 `ra, sp, s0～s11` 的既有布局。
 
 #### 4.3.3 具体实现
 
+**（1）`cpu_idle()`：唯一的调度点。** 空闲线程在 `kern_init()` 末尾被调用，此后不再返回。循环中只做一件事：发现 `need_resched` 非零就调用 `schedule()` 让出 CPU。这里不主动置位 `need_resched`，也不引入时钟抢占；首个调度请求由 `proc_init()` 在初始化 `idleproc` 时置位。
+
+```c
+void cpu_idle(void)
+{
+    while (1)
+    {
+        if (current->need_resched)
+        {
+            schedule();
+        }
+    }
+}
+```
+
+**（2）`schedule()`：选择下一个可运行线程。** 进入函数后先关中断，避免在选择过程中被时钟中断打断。随后清除当前线程的 `need_resched`，并以当前线程为起点计算扫描位置：`idleproc` 不在 `proc_list` 中，因此从链表头开始；普通线程从自己的 `list_link` 之后开始，实现轮转。扫描时跳过链表头哨兵，遇到第一个 `PROC_RUNNABLE` 线程即停止；整圈都没有找到时回退到 `idleproc`。
+
+```c
+current->need_resched = 0;
+last = (current == idleproc) ? &proc_list : &(current->list_link);
+le = last;
+do
+{
+    if ((le = list_next(le)) != &proc_list)
+    {
+        next = le2proc(le, list_link);
+        if (next->state == PROC_RUNNABLE)
+        {
+            break;
+        }
+    }
+} while (le != last);
+
+if (next == NULL || next->state != PROC_RUNNABLE)
+{
+    next = idleproc;
+}
+```
+
+选中后增加目标线程的 `runs` 计数；只有目标与当前线程不同才调用 `proc_run()`。若当前线程本来就是唯一可运行线程（例如全部线程都在等待），则不发生切换，但仍已清除调度请求。最后恢复中断状态，保证从 `cpu_idle` 或线程函数中调用时不会意外改变中断使能。
+
+**（3）`proc_run()`：切换当前线程与页表。** 首先判断目标是否就是当前线程，相同则直接返回，避免无意义切换。否则保存旧线程指针，关中断进入临界区，更新 `current`，按 Sv39 格式写入 `satp` 并执行 `flush_tlb()`，然后调用 `switch_to(&prev->context, &proc->context)` 完成寄存器现场切换。`local_intr_restore()` 在切换后执行，恢复的是进入临界区前的中断状态。
+
+```c
+current = proc;
+uintptr_t satp = (8UL << 60) |
+                 ((proc->pgdir >> RISCV_PGSHIFT) & ((1UL << 44) - 1));
+write_csr(satp, satp);
+flush_tlb();
+switch_to(&(prev->context), &(proc->context));
+```
+
+`satp` 的 MODE 字段为 8（Sv39），PPN 取页表根物理地址右移 12 位后保留低 44 位。本实验所有内核线程共享启动页表，因此切换前后 `satp` 的 PPN 通常相同，但代码仍按“可能不同”处理，为后续用户进程留出接口。
+
+**（4）`switch_to()`：保存与恢复上下文。** 函数参数 `a0`、`a1` 分别指向旧、新 `struct context`。实现按字段顺序保存 `ra`、`sp`、`s0～s11`，再按同样顺序从新 context 恢复；每个寄存器占 8 字节，偏移依次为 0、8、…、104。恢复 `ra` 后执行 `ret`，若目标是新建线程，其 `context.ra` 已被 `copy_thread()` 设为 `forkret`，于是返回到 `forkret` 继续首次运行。
+
+```asm
+switch_to:
+    STORE ra,  0*REGBYTES(a0)
+    STORE sp,  1*REGBYTES(a0)
+    ...
+    STORE s11, 13*REGBYTES(a0)
+
+    LOAD ra,  0*REGBYTES(a1)
+    LOAD sp,  1*REGBYTES(a1)
+    ...
+    LOAD s11, 13*REGBYTES(a1)
+    ret
+```
+
+**（5）首次运行链路。** 新建线程的 `context.ra` 指向 `forkret`，`context.sp` 指向它自己的 Trap frame。`switch_to()` 恢复这两个寄存器后返回 `forkret`；`forkret()` 调用 `forkrets(current->tf)`，后者把 `sp` 设为 Trap frame 地址并跳转 `__trapret`；`__trapret` 从 Trap frame 恢复通用寄存器并执行 `sret`，`epc` 指向 `kernel_thread_entry`；该入口把 `a0` 设为 `s1`（线程参数）、调用 `s0`（线程函数）。整条链路为：
+
+```text
+cpu_idle → schedule → proc_run → switch_to
+    → forkret → forkrets → __trapret
+    → kernel_thread_entry → 线程函数（init_main / 测试线程）
+```
+
+普通线程之间的切换不需要经过完整 Trap 恢复：`switch_to()` 直接恢复对方的 `ra/sp/s0～s11` 后返回到对方上次调用 `switch_to()` 之后的指令，即 `proc_run()` 里 `switch_to()` 的下一条语句。
+
 #### 4.3.4 Spec 与 Prompt
 
+完整提示词记录于 [prompt.md：Lab4 进程调度与上下文切换实现](prompt.md#lab4进程调度与上下文切换实现)。提示词沿用四段式结构，先限定四个函数和修改边界，再列出真实依赖、必须保持的接口以及可检查的前置/后置条件。
+
+| 提示词部分 | 设计内容及实现对应 |
+| --- | --- |
+| `[PROMPT]` | 明确 `cpu_idle/schedule/proc_run/switch_to` 的目标，限定 `//LAB4 function3` 区域，保留 `proc_list`、context、Trap frame 与 `forkret` 链路 |
+| `[RELY]` | 列出 `proc_struct`、`context`、`proc_list`、`current`、`idleproc`、`need_resched`、`runs`、`local_intr_save/restore`、`satp`/`flush_tlb`、`boot_pgdir_pa` 等实际依赖 |
+| `[GUARANTEE]` | 固定四个函数签名，要求移除占位 panic，不修改其他模块和评分脚本 |
+| `[SPECIFICATION]` | 按函数给出 Pre-Condition、Post-Condition 与 Cases，覆盖无就绪线程、目标即当前线程、首次切换和中断保护 |
+
+**Pre-Condition：** 物理内存、启动页表、进程管理已初始化；`current` 指向有效 PCB，`proc_list` 已建立；目标线程的 `pgdir` 是页表根物理地址，`context` 已按 `ra/sp/s0～s11` 布局初始化；调用 `schedule()` 时可在任意线程上下文。
+
+**Post-Condition：** `schedule()` 返回时，`current` 指向一个 `PROC_RUNNABLE` 线程（通常是下一线程或 `idleproc`），其 `runs` 已增加，中断状态与进入前一致；若发生切换，`switch_to()` 之后执行流位于新线程的现场，`satp` 指向新线程页表。
+
+| Case | 规格关注点与实现约定 |
+| --- | --- |
+| 首次调度（idleproc → initproc） | 从链表头扫描，选中 initproc，`need_resched` 清零 |
+| 无其他就绪线程 | 回退 `idleproc`，`next == current` 时不调用 `proc_run` |
+| 普通线程轮转 | 从当前线程之后扫描，跳过链表头哨兵，整圈后回到起点 |
+| 目标即当前线程 | `proc_run` 直接返回，避免无意义切换 |
+| 切换页表 | `satp` 的 MODE=8、PPN=`pgdir>>12`，随后 `flush_tlb` |
+| 中断保护 | `schedule`/`proc_run` 全程关中断，退出时恢复原状态 |
+| 新线程首次运行 | `context.ra=forkret`，经 `forkrets → __trapret → kernel_thread_entry` 进入目标函数 |
+| 汇编 ABI | 只保存/恢复 callee-saved 寄存器，不改 `context` 布局 |
+
 #### 4.3.5 实现及验证过程
+
+**（1）源码核对与实现。** 实现前检查了 `sched.c`、`proc.c`、`switch.S`、`proc.h`、`trap.h`、`trapentry.S`、`process/entry.S`、`sync.h`、`pmm.h` 以及原有测试 `test_lab4.c`，确认 `context` 的字段布局、`local_intr_save/restore()` 的语义、`satp` 的 Sv39 编码方式以及 `forkret → forkrets → __trapret` 的既有链路。四个目标函数原先均为 `Lab4 TODO` 占位，本次在 `//LAB4 function3` 区域完成实现，并将 `YOUR CODE` 替换为学号 `2413042`；模块一、模块二的代码与测试脚本未改动。
+
+实现完成后，用 `objdump` 核对 `switch_to` 的机器码，确认 14 个寄存器的保存/恢复偏移依次为 0、8、…、104，与 `struct context` 的字段顺序一致。
+
+**（2）构建验证。** 在 WSL 的 Ubuntu 环境中使用 `riscv64-unknown-elf-gcc` 构建：
+
+```bash
+cd code
+make -j4
+```
+
+编译、链接与 `bin/ucore.img` 生成均成功，构建日志中没有编译警告或错误。
+
+**（3）集成评分。** 使用仓库自带的测试注入工具与 `make grade` 完成整体验证，实际输出为：
+
+```text
+  -check PMM:                                OK
+  -check Process Create:                     OK
+  -check Schedule:                           OK
+Total Score: 30/30
+```
+
+串口日志中，三项测试与 `init_main` 的输出依次出现：
+
+```text
+[Test PMM] PASS
+check_vma_struct() succeeded!
+check_vmm() succeeded.
+[Test Process Create] PASS
+++ setup timer interrupts
+[Test Schedule] PASS
+this initproc, pid = 1, name = "init"
+To U: "Hello world!!".
+To U: "en.., Bye, Bye. :)"
+```
+
+| 检查项 | 检查方式 | 实际结果 |
+| --- | --- | --- |
+| 构建和链接 | `make -j4` | 通过，生成内核及镜像，无编译警告或错误 |
+| 虚拟内存页操作 | `[Test PMM]` | PASS |
+| 进程创建 | `[Test Process Create]` | PASS |
+| 调度与切换 | `[Test Schedule]`，两个测试线程交替执行 | PASS |
+| 首次运行链路 | `initproc` 打印 PID、名称与两行 `To U` | 通过，输出与预期一致 |
+| 进程退出路径 | `init_main` 返回后进入 `do_exit()` 的 panic | 预期行为：本实验未实现进程退出，评分脚本以 `readline` 断点收尾 |
+| 修改范围 | `git diff` 核对 `//LAB4 function3` 区域 | 通过，模块一/二与测试脚本未改动 |
+
+`[Test Schedule]` 验证的是：`test_lab4_schedule()` 创建两个测试线程，二者各自循环三次并调用 `schedule()`，最终断言两个线程都真正运行过。这说明调度器能够从 `initproc` 切到测试线程、在多个线程之间往返，并保持各自的执行现场。
+
+**（4）GDB 首次运行链路验证。** 以内核符号文件连接 QEMU 的 gdbstub，在关键函数处设置断点，实际命中顺序与现场如下：
+
+```text
+[HIT] cpu_idle     current pid=0 state=2 need_resched=1
+[HIT] schedule     current pid=0 need_resched=1
+[HIT] proc_run     from pid=0 to pid=1 pgdir=0x80208000
+[HIT] switch_to    from=0xffffffffc040e040 to=0xffffffffc040e140
+[HIT] forkret      current pid=1 tf=0xffffffffc0411ee0
+[HIT] forkrets     tf=0xffffffffc0411ee0
+[HIT] __trapret
+[HIT] kernel_thread_entry
+[HIT] init_main    pid=1 name=init
+```
+
+该记录验证了：调度前 `current` 是 PID 为 0 的 `idleproc`（`state=2` 即 `PROC_RUNNABLE`），`need_resched=1`；`proc_run` 把 `current` 切到 PID 1 的 `initproc`，其页表根物理地址为 `0x80208000`；`switch_to` 在两个不同的 context 地址之间切换；新线程经 `forkret`、`forkrets`、`__trapret` 和 `kernel_thread_entry` 到达 `init_main`，此时 `current->pid == 1`、名称为 `init`。链路与设计一致。
+
+**（5）实现中处理的关键问题。**
+
+- **`satp` 的构造。** `lcr3()` 按 Sv32 语义只把地址右移 12 位写入 `satp`，不带 MODE 字段；在 Sv39 下这样写入会得到 MODE=0 的无效值。因此 `proc_run()` 按 `kern_entry` 的写法显式构造 `(8UL << 60) | (pgdir >> 12)`，并对 PPN 取低 44 位。
+- **`idleproc` 的位置。** 模块二有意不把 `idleproc` 加入 `proc_list`，因此 `schedule()` 对 `idleproc` 从链表头开始扫描，对其他线程从自身之后开始；整圈找不到可运行线程时回退到 `idleproc`。若按普通线程处理 `idleproc`，会因为它的 `list_link` 未挂入链表而破坏轮转。
+- **不切换的情况。** 当 `next == current`（例如所有其他线程都在睡眠）时不调用 `proc_run()`，避免无意义地保存和恢复同一现场。
+- **原子性。** `schedule()` 与 `proc_run()` 都在关中断的临界区内完成，退出时通过 `local_intr_restore()` 恢复进入前的中断状态；否则在选择线程或写 `satp` 的间隙被时钟中断打断，会看到 `current`、页表与寄存器现场三者不一致。
+- **首次运行依赖模块二。** `switch_to()` 只负责恢复寄存器，新线程之所以能进入 `init_main`，是因为 `copy_thread()` 已把 `context.ra` 设为 `forkret`、`context.sp` 设为该线程的 Trap frame；两个模块的约定必须同时成立。
+- **`do_exit()` 的 panic 是预期。** `init_main` 返回后由 `kernel_thread_entry` 调用 `do_exit()`，后者在本实验中仍是 panic 占位，因此会进入内核调试监视器；这是评分脚本采集日志所依赖的收尾路径，不是调度失败。
+
+
 
 ---
 
 ## 五、测试与验证
 
-待汇总 Lab4 各模块专项测试及成员 C 的最终集成、回归结果后填写。
+本章汇总 Lab4 的集成测试结果。三项功能测试通过仓库自带的 `tools/inject.py` 注入到 `pmm_init()`、`proc_init()` 与 `init_main()` 的对应位置，由 `make grade` 统一构建、运行并检查串口输出；测试代码与评分脚本保持原样。
+
+**（1）构建与评分命令。**
+
+```bash
+cd code
+make -j4
+make grade
+```
+
+**（2）测试结果。**
+
+| 测试 | 检查内容 | 实际结果 |
+| --- | --- | --- |
+| `check PMM` | `page_insert()`/`page_remove()`、`check_pgdir()`、`check_boot_pgdir()` | OK |
+| `check Process Create` | `idleproc`/`initproc` 的 PID、状态、内核栈、父进程、context 入口 | OK |
+| `check Schedule` | 两个测试线程交替运行、上下文往返 | OK |
+| 首次运行输出 | `initproc` 的 PID、名称与两行 `To U` | 符合预期 |
+| 总分 | 三项测试合计 | 30/30 |
+
+**（3）串口关键输出。**
+
+```text
+check_pgdir() succeeded!
+check_boot_pgdir() succeeded!
+kmalloc_init() succeeded!
+[Test PMM] PASS
+check_vma_struct() succeeded!
+check_vmm() succeeded.
+[Test Process Create] PASS
+++ setup timer interrupts
+[Test Schedule] PASS
+this initproc, pid = 1, name = "init"
+To U: "Hello world!!".
+To U: "en.., Bye, Bye. :)"
+```
+
+**（4）GDB 验证。** 首次运行链路的断点记录见 4.3.5（4）：`current` 从 PID 0 的 `idleproc` 切换到 PID 1 的 `initproc`，`satp` 指向 `0x80208000`，并依次经过 `switch_to → forkret → forkrets → __trapret → kernel_thread_entry → init_main`。
+
+**（5）回归与未覆盖项。**
+
+- 本模块未修改 Trap 与时钟相关代码；启动日志显示时钟中断已正常初始化（`++ setup timer interrupts`），Lab3 的 Trap 入口与中断处理路径未受影响。
+- `init_main` 返回后进入 `do_exit()` 的 panic，本实验未实现进程退出，这是预期的收尾路径。
+- 未覆盖内容：用户进程、缺页异常、页面置换与抢占式调度，均属于后续实验。
+- 已知遗留：模块一记录的 `get_pte()` 第二级页表分配失败残留 1 个页表页（A08.2），不影响本次评分。
 
 ---
 
 ## 六、实验总结与收获
 
-待 Lab4 最终集成完成后，结合实际实现、测试结果和遗留问题填写。
+**（1）执行链闭环。** 从 `kern_init()` 出发，Lab4 的完整路径为：`pmm_init`（物理页、页表自检、kmalloc）→ `vmm_init` → `proc_init`（idleproc/initproc）→ `clock_init`/`intr_enable` → `cpu_idle` → `schedule` → `proc_run` → `switch_to` → `forkret` → `forkrets` → `__trapret` → `kernel_thread_entry` → `init_main`。三个模块的接口在同一次运行中闭合，评分测试也在此基础上额外创建并切换了测试线程。
+
+**（2）设计取舍。** 调度点唯一放在 `cpu_idle()`，符合本实验“空闲线程主动让出 CPU”的模型；选择策略采用最简单的 FIFO/轮转，不引入时间片和优先级；`context` 只保存 callee-saved 寄存器，把调用者保存寄存器留给编译器；`satp` 按 Sv39 显式构造而不复用 `lcr3()`；调度与切换整体关中断，保证 `current`、页表、寄存器现场三者一致。
+
+**（3）验证方法。** 采用分层验证：模块一、二、三各有专项断言与 PASS 标记，整体用 `make grade` 检查 30/30，再用 GDB 断点确认首次运行链路的每个衔接点。报告中的测试结论均来自实际运行记录，未执行的检查不记为通过。
+
+**（4）遗留问题。** 模块一在 `get_pte()` 第二级分配失败时的完整回滚尚未实现（A08.2，残留 1 个页表页）；`do_exit()` 仍是 panic 占位；没有抢占式调度与优先级；用户进程、缺页异常和页面置换留给后续实验。
+
+**（5）收获。** 通过本实验理解了进程切换并非简单的“跳转”，而是 `current`、页表与寄存器现场三件事的原子更新；理解了 `context` 与 Trap frame 的分工，以及新线程首次运行必须借助 `forkret → forkrets → __trapret` 链路的原因；理解了 `satp` 的 MODE/PPN 编码与切换后刷新 TLB 的必要性；也体会到“先约定接口、再分层验证”的工程方法对多人协作的价值。
