@@ -18,7 +18,7 @@ void cons_putc(int c) { sbi_console_putchar((unsigned char)c); }
  * or 0 if none waiting.
  * */
 int cons_getc(void) {
-    int c = 0;
-    c = sbi_console_getchar();
-    return c;
+    int c = sbi_console_getchar();
+    // SBI returns -1 when no character is available; callers expect 0.
+    return c < 0 ? 0 : c;
 }
