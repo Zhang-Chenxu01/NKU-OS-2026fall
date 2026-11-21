@@ -162,7 +162,7 @@ void exception_handler(struct trapframe *tf) {
         //lab5 function1 YOUR CODE update exception_handler
         case CAUSE_USER_ECALL:
             tf->epc += 4;
-            syscall(); // Stub returns -E_UNIMP until Lab5 function1 is completed.
+            syscall(); // ecall is always 4 bytes, including on RVC machines.
             break;
         case CAUSE_BREAKPOINT:
             cprintf("Breakpoint at 0x%lx\n", tf->epc);
