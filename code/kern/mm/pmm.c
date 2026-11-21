@@ -423,3 +423,131 @@ static void check_boot_pgdir(void)
 
     cprintf("check_boot_pgdir() succeeded!\n");
 }
+
+void unmap_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+
+    do
+    {
+        pte_t *ptep = get_pte(pgdir, start, 0);
+        if (ptep == NULL)
+        {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+        if (*ptep != 0)
+        {
+            page_remove_pte(pgdir, start, ptep);
+        }
+        start += PGSIZE;
+    } while (start != 0 && start < end);
+}
+
+void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+
+    uintptr_t d1start, d0start;
+    int free_pt, free_pd0;
+    pde_t *pd0, *pt, pde1, pde0;
+    d1start = ROUNDDOWN(start, PDSIZE);
+    d0start = ROUNDDOWN(start, PTSIZE);
+    do
+    {
+        // level 1 page directory entry
+        pde1 = pgdir[PDX1(d1start)];
+        // if there is a valid entry, get into level 0
+        // and try to free all page tables pointed to by
+        // all valid entries in level 0 page directory,
+        // then try to free this level 0 page directory
+        // and update level 1 entry
+        if (pde1 & PTE_V)
+        {
+            assert(!(pde1 & (PTE_R | PTE_W | PTE_X)));
+            pd0 = page2kva(pde2page(pde1));
+            // try to free all page tables
+            free_pd0 = 1;
+            do
+            {
+                pde0 = pd0[PDX0(d0start)];
+                if (pde0 & PTE_V)
+                {
+                    assert(!(pde0 & (PTE_R | PTE_W | PTE_X)));
+                    pt = page2kva(pde2page(pde0));
+                    // try to free page table
+                    free_pt = 1;
+                    for (int i = 0; i < NPTEENTRY; i++)
+                        if (pt[i] & PTE_V)
+                        {
+                            free_pt = 0;
+                            break;
+                        }
+                    // free it only when all entry are already invalid
+                    if (free_pt)
+                    {
+                        free_page(pde2page(pde0));
+                        pd0[PDX0(d0start)] = 0;
+                    }
+                }
+
+                d0start += PTSIZE;
+            } while (d0start != 0 && d0start < d1start + PDSIZE && d0start < end);
+            // free level 0 page directory only when all pde0s in it are already invalid
+            for (int i = 0; i < NPDEENTRY; i++)
+            {
+                if (pd0[i] != 0)
+                {
+                    free_pd0 = 0;
+                    break;
+                }
+            }
+            if (free_pd0)
+            {
+                free_page(pde2page(pde1));
+                pgdir[PDX1(d1start)] = 0;
+            }
+        }
+        d1start += PDSIZE;
+        d0start = d1start;
+    } while (d1start != 0 && d1start < end);
+    flush_tlb();
+}
+
+
+//lab5 function3 YOUR CODE
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+{
+    return -E_UNIMP; // Integration stub; do not silently share user pages.
+}
+
+struct Page *pgdir_alloc_page(pde_t *pgdir, uintptr_t la, uint32_t perm)
+{
+    struct Page *page = alloc_page();
+    if (page != NULL)
+    {
+        if (page_insert(pgdir, page, la, perm) != 0)
+        {
+            free_page(page);
+            return NULL;
+        }
+        // swap_map_swappable(check_mm_struct, la, page, 0);
+        page->pra_vaddr = la;
+        assert(page_ref(page) == 1);
+        // cprintf("get No. %d  page: pra_vaddr %x, pra_link.prev %x,
+        // pra_link_next %x in pgdir_alloc_page\n", (page-pages),
+        // page->pra_vaddr,page->pra_page_link.prev,
+        // page->pra_page_link.next);
+    }
+
+    return page;
+}
+
+// Use only with interrupts disabled immediately before returning to userspace.
+// Ordinary kernel execution requires sscratch == 0; RESTORE_ALL enforces it.
+void load_esp0(uintptr_t esp0)
+{
+    write_csr(sscratch, esp0);
+}

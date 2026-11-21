@@ -94,6 +94,7 @@
 #define NPTEENTRY       512                    // page table entries per page table
 
 #define PTSIZE          (PGSIZE * NPTEENTRY)    // bytes mapped by a page directory entry
+#define PDSIZE          (PTSIZE * NPDEENTRY) // bytes mapped by one root entry
 #define PTSHIFT         21                      // log2(PTSIZE)
 
 #define PTXSHIFT        12                      // offset of PTX in a linear address

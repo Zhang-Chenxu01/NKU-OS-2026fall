@@ -16,6 +16,21 @@
 #define KSTACKPAGE          2                           // # of pages in kernel stack
 #define KSTACKSIZE          (KSTACKPAGE * PGSIZE)       // sizeof kernel stack
 
+#define USERTOP 0x80000000
+#define USTACKTOP USERTOP
+#define USTACKPAGE 256                   // # of pages in user stack
+#define USTACKSIZE (USTACKPAGE * PGSIZE) // sizeof user stack
+
+#define USERBASE 0x00200000
+#define UTEXT 0x00800000 // where user programs generally begin
+#define USTAB USERBASE   // the location of the user STABS data structure
+
+#define USER_ACCESS(start, end) \
+    (USERBASE <= (start) && (start) < (end) && (end) <= USERTOP)
+
+#define KERN_ACCESS(start, end) \
+    (KERNBASE <= (start) && (start) < (end) && (end) <= KERNTOP)
+
 #ifndef __ASSEMBLER__
 
 #include <defs.h>

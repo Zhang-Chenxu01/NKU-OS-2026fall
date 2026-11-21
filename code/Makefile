@@ -1,4 +1,4 @@
-PROJ	:= lab4
+PROJ	:= lab5
 EMPTY	:=
 SPACE	:= $(EMPTY) $(EMPTY)
 SLASH	:= /
@@ -62,6 +62,8 @@ TARGETS	:=
 
 include tools/function.mk
 
+USER_PREFIX	:= __user_
+
 listf_cc = $(call listf,$(1),$(CTYPE))
 
 # for cc
@@ -78,6 +80,9 @@ asmfile = $(call cgtype,$(call toobj,$(1)),o,asm)
 outfile = $(call cgtype,$(call toobj,$(1)),o,out)
 symfile = $(call cgtype,$(call toobj,$(1)),o,sym)
 
+filename = $(basename $(notdir $(1)))
+ubinfile = $(call outfile,$(addprefix $(USER_PREFIX),$(call filename,$(1))))
+
 # for match pattern
 match = $(shell echo $(2) | $(AWK) '{for(i=1;i<=NF;i++){if(match("$(1)","^"$$(i)"$$")){exit 1;}}}'; echo $$?)
 
@@ -93,6 +98,38 @@ LIBDIR	+= libs
 $(call add_files_cc,$(call listf_cc,$(LIBDIR)),libs,)
 
 # -------------------------------------------------------------------
+# user programs
+
+UINCLUDE	+= user/include/ \
+			   user/libs/
+
+USRCDIR		+= user
+
+ULIBDIR		+= user/libs
+
+UCFLAGS		+= $(addprefix -I,$(UINCLUDE))
+USER_BINS	:=
+
+$(call add_files_cc,$(call listf_cc,$(ULIBDIR)),ulibs,$(UCFLAGS))
+$(call add_files_cc,$(call listf_cc,$(USRCDIR)),uprog,$(UCFLAGS))
+
+# SBI and the existing kernel readline must never enter user binaries.
+UOBJS	:= $(call read_packet,ulibs) $(filter-out $(call toobj,libs/sbi.c libs/readline.c),$(call read_packet,libs))
+
+define uprog_ld
+__user_bin__ := $$(call ubinfile,$(1))
+USER_BINS += $$(__user_bin__)
+$$(__user_bin__): tools/user.ld
+$$(__user_bin__): $$(UOBJS)
+$$(__user_bin__): $(1) | $$$$(dir $$$$@)
+	$(V)$(LD) $(LDFLAGS) -T tools/user.ld -o $$@ $$(UOBJS) $(1)
+	@$(OBJDUMP) -S $$@ > $$(call cgtype,$$<,o,asm)
+	@$(OBJDUMP) -t $$@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$$$/d' > $$(call cgtype,$$<,o,sym)
+endef
+
+$(foreach p,$(call read_packet,uprog),$(eval $(call uprog_ld,$(p))))
+
+# -------------------------------------------------------------------
 # kernel
 
 KINCLUDE	+= kern/debug/ \
@@ -102,7 +139,8 @@ KINCLUDE	+= kern/debug/ \
 			   kern/sync/ \
 			   kern/fs/ \
 			   kern/process \
-			   kern/schedule
+			   kern/schedule \
+			   kern/syscall
 
 KSRCDIR		+= kern/init \
 			   kern/libs \
@@ -112,11 +150,13 @@ KSRCDIR		+= kern/init \
 			   kern/mm \
 			   kern/fs \
 			   kern/process \
-			   kern/schedule
+			   kern/schedule \
+			   kern/syscall
 
 KCFLAGS		+= $(addprefix -I,$(KINCLUDE))
 
-$(call add_files_cc,$(call listf_cc,$(KSRCDIR)),kernel,$(KCFLAGS))
+# The archive's kern/libs/readline.c duplicates the retained libs/readline.c.
+$(call add_files_cc,$(filter-out kern/libs/readline.c,$(call listf_cc,$(KSRCDIR))),kernel,$(KCFLAGS))
 
 KOBJS	= $(call read_packet,kernel libs)
 
@@ -125,9 +165,9 @@ kernel = $(call totarget,kernel)
 
 $(kernel): tools/kernel.ld
 
-$(kernel): $(KOBJS)
+$(kernel): $(KOBJS) $(USER_BINS)
 	@echo + ld $@
-	$(V)$(LD) $(LDFLAGS) -T tools/kernel.ld -o $@ $(KOBJS)
+	$(V)$(LD) $(LDFLAGS) -T tools/kernel.ld -o $@ $(KOBJS) --format=binary $(USER_BINS) --format=default
 	@$(OBJDUMP) -S $@ > $(call asmfile,kernel)
 	@$(OBJDUMP) -t $@ | $(SED) '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $(call symfile,kernel)
 
@@ -154,6 +194,8 @@ IGNORE_ALLDEPS	= clean \
 				  grade \
 				  touch \
 				  print-.+ \
+				  run-.+ \
+				  build-.+ \
 				  handin
 
 ifeq ($(call match,$(MAKECMDGOALS),$(IGNORE_ALLDEPS)),0)
@@ -192,17 +234,29 @@ gdb:
 spike: $(UCOREIMG) $(SWAPIMG) $(SFSIMG)
 	$(V)$(SPIKE) $(UCOREIMG)
 
+RUN_PREFIX	:= _binary_$(OBJDIR)_$(USER_PREFIX)
+MAKEOPTS	:= --quiet --no-print-directory
+
+run-%: build-%
+	$(V)$(MAKE) $(MAKEOPTS) qemu
+
+run-nox-%: build-%
+	$(V)$(MAKE) $(MAKEOPTS) qemu
+
+build-%: touch
+	$(V)$(MAKE) $(MAKEOPTS) "DEFS+=-DTEST=$* -DTESTSTART=$(RUN_PREFIX)$*_out_start -DTESTSIZE=$(RUN_PREFIX)$*_out_size"
+
 .PHONY: grade touch
 
 GRADE_GDB_IN	:= .gdb.in
 GRADE_QEMU_OUT	:= .qemu.out
 HANDIN			:= proj$(PROJ)-handin.tar.gz
 
-TOUCH_FILES		:= kern/trap/trap.c
+TOUCH_FILES		:= kern/process/proc.c
 
 MAKEOPTS		:= --quiet --no-print-directory
 
-GRADE_TMP		:= /tmp/lab4_grade
+GRADE_TMP		:= /tmp/lab5_grade
 
 grade:
 	$(V)$(MAKE) $(MAKEOPTS) clean

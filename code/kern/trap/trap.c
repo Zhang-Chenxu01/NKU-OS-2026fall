@@ -9,6 +9,10 @@
 #include <sbi.h>  // 2411566：中断处理使用的 SBI 接口。
 #include <stdio.h>
 #include <trap.h>
+#include <proc.h>
+#include <sched.h>
+#include <syscall.h>
+#include <error.h>
 
 #define TICK_NUM 100
 #define SHUTDOWN_AFTER 3  // 2411566：累计输出三次时钟统计后请求关机。
@@ -155,6 +159,11 @@ static size_t insn_length(uintptr_t epc) {
 //lab3 function2 2413042
 void exception_handler(struct trapframe *tf) {
     switch (tf->cause) {
+        //lab5 function1 YOUR CODE update exception_handler
+        case CAUSE_USER_ECALL:
+            tf->epc += 4;
+            syscall(); // Stub returns -E_UNIMP until Lab5 function1 is completed.
+            break;
         case CAUSE_BREAKPOINT:
             cprintf("Breakpoint at 0x%lx\n", tf->epc);
             tf->epc += insn_length(tf->epc);
@@ -188,5 +197,30 @@ static inline void trap_dispatch(struct trapframe *tf) {//判断是异常还是�
  * */
 void trap(struct trapframe *tf) {
     // dispatch based on what type of trap occurred
-    trap_dispatch(tf);
+    if (current == NULL)
+    {
+        trap_dispatch(tf);
+    }
+    else
+    {
+        struct trapframe *otf = current->tf;
+        current->tf = tf;
+
+        bool in_kernel = trap_in_kernel(tf);
+
+        trap_dispatch(tf);
+
+        current->tf = otf;
+        if (!in_kernel)
+        {
+            if (current->flags & PF_EXITING)
+            {
+                do_exit(-E_KILLED);
+            }
+            if (current->need_resched)
+            {
+                schedule();
+            }
+        }
+    }
 }

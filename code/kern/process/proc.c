@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unistd.h>
 
 /* ------------- process/thread mechanism design&implementation -------------
 (an simplified Linux process/thread mechanism )
@@ -98,6 +99,40 @@ get_proc_name(struct proc_struct *proc)
     return memcpy(name, proc->name, PROC_NAME_LEN);
 }
 
+// set_links - set the relation links of process
+static void
+set_links(struct proc_struct *proc)
+{
+    list_add(&proc_list, &(proc->list_link));
+    proc->yptr = NULL;
+    if ((proc->optr = proc->parent->cptr) != NULL)
+    {
+        proc->optr->yptr = proc;
+    }
+    proc->parent->cptr = proc;
+    nr_process++;
+}
+
+// remove_links - clean the relation links of process
+static void
+remove_links(struct proc_struct *proc)
+{
+    list_del(&(proc->list_link));
+    if (proc->optr != NULL)
+    {
+        proc->optr->yptr = proc->yptr;
+    }
+    if (proc->yptr != NULL)
+    {
+        proc->yptr->optr = proc->optr;
+    }
+    else
+    {
+        proc->parent->cptr = proc->optr;
+    }
+    nr_process--;
+}
+
 // get_pid - alloc a unique pid for process
 static int
 get_pid(void)
@@ -158,6 +193,13 @@ hash_proc(struct proc_struct *proc)
     list_add(hash_list + pid_hashfn(proc->pid), &(proc->hash_link));
 }
 
+// unhash_proc - delete proc from proc hash_list
+static void
+unhash_proc(struct proc_struct *proc)
+{
+    list_del(&(proc->hash_link));
+}
+
 // find_proc - find proc frome proc hash_list according to pid
 struct proc_struct *
 find_proc(int pid)
@@ -199,16 +241,42 @@ put_kstack(struct proc_struct *proc)
 }
 
 
+// setup_pgdir - alloc one page as PDT
+static int
+setup_pgdir(struct mm_struct *mm)
+{
+    struct Page *page;
+    if ((page = alloc_page()) == NULL)
+    {
+        return -E_NO_MEM;
+    }
+    pde_t *pgdir = page2kva(page);
+    memcpy(pgdir, boot_pgdir_va, PGSIZE);
+
+    mm->pgdir = pgdir;
+    return 0;
+}
+
+// put_pgdir - free the memory space of PDT
+static void
+put_pgdir(struct mm_struct *mm)
+{
+    free_page(kva2page(mm->pgdir));
+}
+
 // do_exit - called by sys_exit
 //   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
 //   2. set process' state as PROC_ZOMBIE, then call wakeup_proc(parent) to ask parent reclaim itself.
 //   3. call scheduler to switch to other process
+//lab5 function4 YOUR CODE
 int do_exit(int error_code)
 {
     panic("process exit!!.\n");
 }
 
 // init_main - the second kernel thread used to create user_main kernel threads
+//lab5 function2 YOUR CODE
+// Lab4 bootstrap is retained until user_main/load_icode/do_wait are implemented.
 static int
 init_main(void *arg)
 {
@@ -219,6 +287,8 @@ init_main(void *arg)
 }
 
 //LAB4 function2 2411566
+//lab5 function2 YOUR CODE update alloc_proc
+// The existing memset also initializes the appended Lab5 fields.
 static struct proc_struct *alloc_proc(void)
 {
     struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
@@ -235,6 +305,7 @@ static struct proc_struct *alloc_proc(void)
     return proc;
 }
 
+//lab5 function3 YOUR CODE update copy_mm
 static int copy_mm(uint32_t clone_flags, struct proc_struct *proc)
 {
     // Lab4 kernel threads use the boot page table without owning an mm.
@@ -258,6 +329,8 @@ static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapfram
     proc->context.sp = (uintptr_t)(proc->tf);
 }
 
+//lab5 function3 YOUR CODE
+// Keep the Lab4 creation path; user-mm copying remains in copy_mm.
 int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
 {
     if (nr_process >= MAX_PROCESS)
@@ -288,8 +361,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     local_intr_save(intr_flag);
     proc->pid = get_pid();
     hash_proc(proc);
-    list_add(&proc_list, &(proc->list_link));
-    nr_process++;
+    set_links(proc);
     wakeup_proc(proc);
     ret = proc->pid;
     local_intr_restore(intr_flag);
@@ -302,6 +374,7 @@ bad_proc:
     return ret;
 }
 
+//lab5 function2 YOUR CODE update kernel_thread
 int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
 {
     struct trapframe tf;
@@ -382,4 +455,68 @@ void cpu_idle(void)
             schedule();
         }
     }
+}
+
+#define __KERNEL_EXECVE(name, binary, size) ({           \
+    cprintf("kernel_execve: pid = %d, name = \"%s\".\n", \
+            current->pid, name);                         \
+    kernel_execve(name, binary, (size_t)(size));         \
+})
+
+#define KERNEL_EXECVE(x) ({                                    \
+    extern unsigned char _binary_obj___user_##x##_out_start[], \
+        _binary_obj___user_##x##_out_size[];                   \
+    __KERNEL_EXECVE(#x, _binary_obj___user_##x##_out_start,    \
+                    _binary_obj___user_##x##_out_size);        \
+})
+
+#define __KERNEL_EXECVE2(x, xstart, xsize) ({   \
+    extern unsigned char xstart[], xsize[];     \
+    __KERNEL_EXECVE(#x, xstart, (size_t)xsize); \
+})
+
+#define KERNEL_EXECVE2(x, xstart, xsize) __KERNEL_EXECVE2(x, xstart, xsize)
+
+
+// Integration stubs: keep the Lab5 exercises explicit and the Lab4 boot usable.
+//lab5 function2 YOUR CODE
+static int load_icode(unsigned char *binary, size_t size)
+{
+    return -E_UNIMP;
+}
+
+int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
+{
+    return -E_UNIMP;
+}
+
+int do_wait(int pid, int *code_store)
+{
+    return -E_UNIMP;
+}
+
+static int kernel_execve(const char *name, unsigned char *binary, size_t size)
+{
+    return -E_UNIMP;
+}
+
+static int user_main(void *arg)
+{
+#ifdef TEST
+    KERNEL_EXECVE2(TEST, TESTSTART, TESTSIZE);
+#else
+    KERNEL_EXECVE(exit);
+#endif
+    return -E_UNIMP;
+}
+
+//lab5 function4 YOUR CODE
+int do_yield(void)
+{
+    return -E_UNIMP;
+}
+
+int do_kill(int pid)
+{
+    return -E_UNIMP;
 }

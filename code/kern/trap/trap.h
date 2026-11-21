@@ -43,7 +43,10 @@ struct trapframe {
     struct pushregs gpr;//通用寄存器，保存ra\sp\a0等
     uintptr_t status;//保存处理器的状态信息
     uintptr_t epc;//保存Trap返回时使用的程序地址
-    uintptr_t badvaddr;
+    union {
+        uintptr_t badvaddr; // Lab3/Lab4 name
+        uintptr_t tval;     // Lab5 name for the same stval slot
+    };
     uintptr_t cause;
 };
 

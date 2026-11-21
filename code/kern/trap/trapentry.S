@@ -2,7 +2,11 @@
 
     .macro SAVE_ALL
 
-    csrw sscratch, sp
+    # Lab5: sscratch is zero in S-mode, or the kernel-stack top in U-mode.
+    csrrw sp, sscratch, sp
+    bnez sp, 1f
+    csrr sp, sscratch
+1:
 
     addi sp, sp, -36 * REGBYTES
     # save x registers
@@ -62,6 +66,15 @@
     LOAD s1, 33*REGBYTES(sp)
     csrw sstatus, s0
     csrw sepc, s1
+
+    # Return to U-mode with a kernel stack available for the next trap.
+    # S-mode keeps sscratch zero so nested traps use their current stack.
+    andi s0, s0, SSTATUS_SPP
+    csrw sscratch, zero
+    bnez s0, 1f
+    addi s0, sp, 36 * REGBYTES
+    csrw sscratch, s0
+1:
 
     LOAD x1, 1*REGBYTES(sp)
     LOAD x3, 3*REGBYTES(sp)

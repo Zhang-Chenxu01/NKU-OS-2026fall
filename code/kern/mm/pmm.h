@@ -43,6 +43,13 @@ extern uintptr_t *satp_virtual;
 extern uintptr_t satp_physical;
 
 void pmm_init(void);
+void load_esp0(uintptr_t esp0);
+struct Page *pgdir_alloc_page(pde_t *pgdir, uintptr_t la, uint32_t perm);
+void unmap_range(pde_t *pgdir, uintptr_t start, uintptr_t end);
+void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end);
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share);
+
+void print_pgdir(void);
 
 pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create);
 struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store);
