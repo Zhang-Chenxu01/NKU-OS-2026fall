@@ -518,9 +518,85 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 
 
 //lab5 function3 YOUR CODE
+/* Read-only lookup for copy_range: distinguish absent subtrees from the
+ * large leaves that get_pte deliberately refuses to descend into. */
+static int copy_range_lookup(pde_t *pgdir, uintptr_t addr,
+                             pte_t **ptep, uintptr_t *next)
+{
+    *ptep = NULL;
+    *next = ROUNDDOWN(addr + PDSIZE, PDSIZE);
+    pde_t entry = pgdir[PDX1(addr)];
+    if (!(entry & PTE_V))
+        return 0;
+    if (entry & (PTE_R | PTE_W | PTE_X))
+        return -E_INVAL;
+
+    entry = ((pde_t *)KADDR(PDE_ADDR(entry)))[PDX0(addr)];
+    *next = ROUNDDOWN(addr + PTSIZE, PTSIZE);
+    if (!(entry & PTE_V))
+        return 0;
+    if (entry & (PTE_R | PTE_W | PTE_X))
+        return -E_INVAL;
+
+    *ptep = get_pte(pgdir, addr, 0);
+    *next = addr + PGSIZE;
+    return (*ptep != NULL) ? 0 : -E_INVAL;
+}
+
 int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
 {
-    return -E_UNIMP; // Integration stub; do not silently share user pages.
+    if (to == NULL || from == NULL || to == from ||
+        start % PGSIZE != 0 || end % PGSIZE != 0 ||
+        start > end || start < USERBASE || end > USERTOP)
+        return -E_INVAL;
+    if (start == end)
+        return 0;
+    /* CLONE_VM shares the whole mm in copy_mm, not individual pages here. */
+    if (share)
+        return -E_UNIMP;
+
+    while (start < end)
+    {
+        pte_t *src, *dst;
+        uintptr_t next;
+        int ret = copy_range_lookup(from, start, &src, &next);
+        if (ret != 0)
+            return ret;
+        if (src == NULL || !(*src & PTE_V))
+        {
+            start = next;
+            continue;
+        }
+
+        uint32_t perm = *src & (PTE_U | PTE_R | PTE_W | PTE_X);
+        /* Reject non-user/non-leaf entries and the illegal Sv39 W-without-R
+         * encoding; page_insert would otherwise silently add read access. */
+        if (!(perm & PTE_U) || !(perm & (PTE_R | PTE_X)) ||
+            ((perm & PTE_W) && !(perm & PTE_R)))
+            return -E_INVAL;
+
+        ret = copy_range_lookup(to, start, &dst, &next);
+        if (ret != 0)
+            return ret;
+        if (dst != NULL && *dst != 0)
+            return -E_EXISTS; // Never replace a mapping or reserved PTE state.
+
+        struct Page *page = alloc_page();
+        if (page == NULL)
+            return -E_NO_MEM;
+        memcpy(page2kva(page), page2kva(pte2page(*src)), PGSIZE);
+        ret = page_insert(to, page, start, perm);
+        if (ret != 0)
+        {
+            free_page(page); // No mapping/ref was acquired on insert failure.
+            return ret;
+        }
+        /* The destination now owns this page (ref == 1). Earlier mappings
+         * and any attached empty tables are rolled back by the caller's mm
+         * teardown if a later page fails; do not free them twice here. */
+        start += PGSIZE;
+    }
+    return 0;
 }
 
 struct Page *pgdir_alloc_page(pde_t *pgdir, uintptr_t la, uint32_t perm)
