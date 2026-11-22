@@ -5,6 +5,16 @@
 
 #define ELF_MAGIC   0x464C457FU         // "\x7FELF" in little endian
 
+/* e_elf starts immediately after the magic bytes of ELF e_ident. */
+#define ELF_IDENT_CLASS      0
+#define ELF_IDENT_DATA       1
+#define ELF_IDENT_VERSION    2
+#define ELF_CLASS_64         2
+#define ELF_DATA_LSB         1
+#define ELF_VERSION_CURRENT  1
+#define ELF_ET_EXEC          2
+#define ELF_EM_RISCV         243
+
 /* file header */
 struct elfhdr {
     uint32_t e_magic;     // must equal ELF_MAGIC
@@ -33,11 +43,12 @@ struct proghdr {
     uint64_t p_pa;     // physical address, not used
     uint64_t p_filesz; // size of segment in file
     uint64_t p_memsz;  // size of segment in memory (bigger if contains bss）
-    uint64_t p_align;  // required alignment, invariably hardware page size
+    uint64_t p_align;  // required alignment (0 and 1 mean no alignment)
 };
 
 /* values for Proghdr::p_type */
 #define ELF_PT_LOAD                     1
+#define ELF_PT_INTERP                   3
 
 /* flag bits for Proghdr::p_flags */
 #define ELF_PF_X                        1
