@@ -14,21 +14,27 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| **实验名称** |  |
+| **实验名称** | Lab5：用户程序 |
 | **小组成员** | 2411326-张晨旭、2411566-罗晟皓、2413042-郭桦 |
-| **完成日期** |  |
+| **完成日期** | 2026-11-24 |
 
 ### 小组分工
 
 | 成员 | 功能模块 | 负责的任务与修改范围 |
 | --- | --- | --- |
-| 2411326-张晨旭 |  |  |
-| 2411566-罗晟皓 |  |  |
-| 2413042-郭桦 |  |  |
+| 2411326-张晨旭 | 用户态系统调用与异常入口 | `trap.c` 的 `exception_handler`、`syscall.c` 的 `syscall` 与各 `sys_*`、`trapentry.S` 的 U/S 双模式上下文保存恢复、`pmm.c` 的 `copy_range` |
+| 2411566-罗晟皓 | 用户进程创建、ELF 装载与 fork 主流程 | `proc.c` 的 `alloc_proc`、`proc_init`、`kernel_thread`、`init_main`、`user_main`、`kernel_execve`、`do_execve`、`load_icode`、`do_fork`、`copy_mm`、`copy_thread` |
+| 2413042-郭桦 | 地址空间复制与进程生命周期 | `vmm.c` 的 `dup_mmap`，`proc.c` 的 `do_exit`、`do_wait`、`do_yield`、`do_kill`，以及联调阶段的时钟抢占与回收口径修正 |
 
 ---
 
 ## 一、实验目的
+
+1. 理解第一个用户进程的创建过程：内核如何把一段内核线程改造成用户进程，如何为用户程序准备独立的地址空间、用户栈和执行现场，以及如何借助异常返回路径完成从 S 态到 U 态的第一次特权级切换。
+2. 理解系统调用框架的实现机制：用户库如何用 `ecall` 把请求送进内核，异常入口如何识别用户态系统调用并修正返回地址，内核如何按调用号分发到具体实现，并把结果写回用户可见的返回寄存器。
+3. 理解 ucore 如何用 `sys_fork`、`sys_exec`、`sys_wait`、`sys_exit`、`sys_yield`、`sys_kill` 等系统调用管理进程：`fork` 如何复制地址空间与执行上下文，`exec` 如何替换进程映像，`exit` 如何回收资源并把进程交给父进程收割。
+4. 理解用户进程的生命周期与状态转换：`PROC_UNINIT`、`PROC_RUNNABLE`、`PROC_SLEEPING`、`PROC_ZOMBIE` 之间的迁移条件，父子进程链、等待状态与僵尸回收的配合关系，以及进程数量、页表引用计数与物理页回收的一致性。
+5. 掌握用双 GDB（ucore 侧与 QEMU 侧）观察 `ecall`/`sret` 处理流程的方法，能够把一条用户态指令与模拟器内部的地址翻译、特权级切换过程对应起来。
 
 ---
 
@@ -53,7 +59,27 @@
 
 ### 本章节的逻辑主线
 
+Lab4 结束时，系统已经能创建内核线程、保存 Trap 现场并在内核线程之间切换，但所有执行都停留在 S 态。Lab5 要补上的是"用户程序"这一层：让一段受限制的代码在 U 态运行，并且能够在需要内核服务时安全地回到内核、再安全地返回。
+
+这条主线可以拆成四个有先后依赖的环节。
+
+1. **建立双向的特权级通道。** 先有 `ecall` 进入内核的入口（`trapentry.S` 的 U/S 双模式保存、`exception_handler` 的识别、`syscall` 的分发），再有 `sret` 返回用户态的出口。通道不通，后面的装载和复制都无法验证。
+2. **造出第一个用户进程。** 内核启动时只有一个内核线程，它没有任何用户映像。需要构造一次"从内核线程到用户进程"的转换：装载 ELF、建立用户页表与用户栈、填写 Trap 帧，再借用异常返回路径完成第一次 `sret`。
+3. **让用户进程可以复制自己。** `fork` 需要把父进程的 VMA 与页表映射完整复制到子进程，并让父子拥有各自的 PCB、内核栈与执行现场，从而在同一条用户指令之后分道扬镳。
+4. **让用户进程能够结束并被回收。** `exit` 释放用户地址空间、把进程置为僵尸并唤醒父进程；`wait` 收集退出码并回收子进程剩余资源；`yield` 与 `kill` 提供让出与终止两种控制方式。三者与调度器、进程树共同构成生命周期的闭环。
+
+四个环节的顺序也决定了调试顺序：先用内核自检确认引导期内存管理与页表仍然正确，再确认首个用户程序能进入 U 态并打印，随后确认 `fork` 能复制出可独立运行的子进程，最后确认 `exit`/`wait`/`kill` 能在多进程并发退出时不泄漏、不悬挂。
+
 ### 功能的逐步实现
+
+| 步骤 | 实现内容 | 关键函数 | 通过什么确认 |
+| --- | --- | --- | --- |
+| 1 | 系统调用入口与返回 | `trapentry.S`、`exception_handler`、`syscall` | `[Test Syscall] PASS`，用户程序能通过 `cprintf` 输出 |
+| 2 | 第一个用户进程 | `alloc_proc`、`kernel_thread`、`user_main`、`kernel_execve`、`do_execve`、`load_icode` | `kernel_execve: pid = 2, name = "hello".` 与 `hello pass.` |
+| 3 | 地址空间复制 | `do_fork`、`copy_mm`、`dup_mmap`、`copy_range` | `fork ok.`、`forktest pass.` |
+| 4 | 进程退出与回收 | `do_exit`、`do_wait`、`exit_mmap` | `exit pass.`、`all user-mode processes have quit.`、`init check memory pass.` |
+| 5 | 让出与终止 | `do_yield`、`do_kill`、时钟抢占 | `yield pass.`、`spin may pass.` |
+| 6 | 整体回归 | 全部模块 | `make grade` 13 个用户程序全过 |
 
 ---
 
@@ -257,19 +283,176 @@ U parent pid=2, fork result=3, shared write=3
 
 ---
 
-### 4.4
+### 4.4 地址空间复制与进程生命周期控制
 
-**负责人：**
+**负责人：** 2413042-郭桦
 
 #### 4.4.1 模块功能描述
 
+本模块承担 fork 的地址空间复制，以及用户进程从"能跑"到"能结束、能被回收"的全部收尾工作，共五个函数：`dup_mmap`、`do_exit`、`do_wait`、`do_yield`、`do_kill`。它位于另外两个模块的下游：分页层的 `copy_range` 由 `dup_mmap` 调用，进程创建层的 `do_fork`/`copy_mm` 决定何时调用 `dup_mmap`；系统调用层把 `SYS_exit`、`SYS_wait`、`SYS_yield`、`SYS_kill` 转发到本模块，本模块再回到调度器。[地址空间复制](../code/kern/mm/vmm.c) · [生命周期控制](../code/kern/process/proc.c)
+
+```text
+fork:  sys_fork → do_fork → copy_mm ──普通 fork──→ dup_mmap → mm_map + copy_range
+                                  └──CLONE_VM──→ 共享 mm，只增引用
+exit:  sys_exit → do_exit → 释放 mm → 置 ZOMBIE → 唤醒父进程 → 子进程改挂 initproc → schedule
+wait:  sys_wait → do_wait → 扫子进程 → 僵尸则回收返回 0 / 否则睡 WT_CHILD
+kill:  sys_kill → do_kill → 置 PF_EXITING → trap 返回用户态前转 do_exit(-E_KILLED)
+```
+
+模块要保证的三条不变式是：**父子进程的用户页互不可见对方的修改**（普通 fork）、**每个 `mm` 的引用计数与使用者数量一致**、**任何一个用户进程都不会在持有资源的情况下永久消失**（要么被父进程回收，要么被 `initproc` 收养后回收）。
+
 #### 4.4.2 关键接口与设计
+
+| 数据结构或接口 | 定义位置 | 本模块中的作用 |
+| --- | --- | --- |
+| `dup_mmap(to, from)`、`mm_map()`、`copy_range()` | [vmm.c](../code/kern/mm/vmm.c)、[pmm.c](../code/kern/mm/pmm.c) | `dup_mmap` 先按 VMA 逐个登记子进程的地址区间，再按区间复制实际存在的页；`mm_map` 负责区间与权限登记，`copy_range` 负责页表与页内容 |
+| `mm_count`、`exit_mmap()`、`put_pgdir()`、`mm_destroy()` | [vmm.h](../code/kern/mm/vmm.h)、[vmm.c](../code/kern/mm/vmm.c)、[proc.c](../code/kern/process/proc.c) | `mm_count` 记录有多少进程在用同一个地址空间。退出时先减引用，只有归零才拆页表；`exit_mmap` 要求计数已为 0 |
+| `satp`、`boot_pgdir_pa`、`flush_tlb()` | [proc.c](../code/kern/process/proc.c)、[pmm.h](../code/kern/mm/pmm.h) | 释放自己的页表前必须先把 `satp` 切回启动页表并刷新 TLB，否则内核会在已释放的页表上继续取指 |
+| `WT_CHILD`、`wait_state`、`wakeup_proc()`、`schedule()` | [proc.h](../code/kern/process/proc.h)、[sched.c](../code/kern/schedule/sched.c) | 父进程在 `do_wait` 中以 `WT_CHILD` 睡眠，`do_exit` 依据该标志决定是否唤醒；`schedule()` 是退出与睡眠共同的让出点 |
+| `unhash_proc()`、`remove_links()`、`put_kstack()`、`kfree()` | [proc.c](../code/kern/process/proc.c) | 僵尸回收的四件套：摘 PID 哈希、摘进程链表并更新进程计数、释放内核栈、释放 PCB |
+| `PF_EXITING`、`trap()`、`exception_handler()` | [proc.h](../code/kern/process/proc.h)、[trap.c](../code/kern/trap/trap.c) | `do_kill` 只置标志，真正的退出发生在被终止进程下一次从内核返回用户态之前，由 `trap()` 检查 `PF_EXITING` 后调用 `do_exit(-E_KILLED)` |
+
+进程状态与父子关系的约定沿用 Lab4：`cptr` 指向最新建立的子进程，`yptr`/`optr` 构成同级兄弟链；`proc_list` 只挂可调度进程，`idleproc` 不在此链表中；`nr_process` 由 `set_links()`/`remove_links()` 维护。
 
 #### 4.4.3 具体实现
 
+**（1）`dup_mmap`：先复制区间，再复制页面。** 子进程的地址空间必须与父进程形状一致，但物理页必须独立。因此复制分成两段，对父进程 `mmap_list` 上的每个 VMA 依次执行：
+
+```c
+list_entry_t *list = &(from->mmap_list), *le = list;
+while ((le = list_next(le)) != list) {
+    struct vma_struct *vma = le2vma(le, list_link);
+
+    // 1. 子进程登记同范围、同权限的 VMA
+    int ret = mm_map(to, vma->vm_start, vma->vm_end - vma->vm_start, vma->vm_flags, NULL);
+    if (ret != 0) return ret;
+
+    // 2. 复制真实存在的页；guard 页之类的空洞保持未映射
+    if (vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC)) {
+        ret = copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, 0);
+        if (ret != 0) return ret;
+    }
+}
+```
+
+第一段只登记区间与权限，保证子进程的 VMA 链与父进程同序同形；第二段才按页复制，`copy_range` 对未建立映射的虚拟页直接跳过。这样处理的好处是：用户栈最低一页本来就是"只登记不映射"的保护页，子进程里它同样保持空映射，不会被凭空造出一张物理页；而代码段、数据段、栈页则被逐页复制成独立物理页。复制失败时 `dup_mmap` 只返回错误码，不自行清理，由 `copy_mm` 统一销毁这个尚未交付的私有地址空间，避免"一边复制一边释放"造成的双重回收。
+
+**（2）`do_exit`：先断开地址空间，再宣告死亡。** 退出路径有一个不能调换的顺序：**先切页表，后减引用**。进程此时仍运行在自己的用户页表上，而 `satp` 正指向即将被拆掉的根页表。因此先把 `current->mm` 置空、`current->pgdir` 改回启动页表物理地址，写入 `satp` 并 `flush_tlb()`，让内核切到启动页表上继续执行；然后才把该 `mm` 的引用计数减一。只有计数归零（没有 `CLONE_VM` 的兄弟还在共享）时，才真正执行 `exit_mmap`、`put_pgdir`、`mm_destroy`。[退出流程](../code/kern/process/proc.c)
+
+```c
+current->mm = NULL;
+current->pgdir = boot_pgdir_pa;
+write_csr(satp, (8UL << 60) | (boot_pgdir_pa >> RISCV_PGSHIFT));
+flush_tlb();
+if (mm_count_dec(mm) == 0)
+    destroy_unreferenced_mm(mm);   // exit_mmap + put_pgdir + mm_destroy
+```
+
+资源处理完后再进入关中断区完成"死亡宣告"：把状态置为 `PROC_ZOMBIE`、记录退出码；若父进程正睡在 `WT_CHILD` 上则唤醒它；把自己的子进程全部改挂到 `initproc` 名下（僵尸不能等待，孤儿必须有人收割），若被改挂的子进程本身已是僵尸，还要顺带唤醒 `initproc`。最后调用 `schedule()` 交出 CPU，函数以 `panic` 兜底——僵尸进程不会再被调度回来。`idleproc` 不允许退出，因为它是调度器的兜底；`initproc` 允许退出，因为 `init_main` 在回收完所有用户进程后返回，`kernel_thread_entry` 会把这次返回接到 `do_exit` 上，此后系统在 `idleproc` 中空转。
+
+**（3）`do_wait`：先按 pid 过滤，再判断该不该睡。** 等待的语义有三个分支必须同时成立：等待任意子进程需要阻塞、等待指定子进程需要阻塞、指定了一个不存在（或为负）的 pid 需要立刻报错。实现上先做过滤，再统计"是否存在匹配的子进程"：
+
+```c
+for (le = &proc_list; (le = list_next(le)) != &proc_list;) {
+    proc = le2proc(le, list_link);
+    if (proc->parent != current) continue;
+    if (pid != 0 && proc->pid != pid) continue;   // 先按 pid 过滤
+    has_child = 1;
+    if (proc->state != PROC_ZOMBIE) continue;     // 有子进程但尚未退出
+    /* 取退出码；unhash_proc + remove_links + put_kstack + kfree 后返回 0 */
+}
+if (!has_child) return -E_BAD_PROC;               // 负 pid / 无此子进程 / 无子进程
+```
+
+把过滤放在计数之前，`pid = -1` 这类输入自然得到 `-E_BAD_PROC` 而不是永久睡眠；`pid = 0` 且已无子进程时同样返回 `-E_BAD_PROC`，这正是 `init_main` 结束等待循环的条件。找到僵尸后，取出退出码，在关中断区依次 `unhash_proc`、`remove_links`（内部递减 `nr_process`），再释放内核栈和 PCB。若匹配的子进程尚未退出，则把当前进程置为 `PROC_SLEEPING`、`wait_state = WT_CHILD` 后睡眠；被唤醒后清空 `wait_state` 重新扫描，并检查自己是否已被 `kill`（`PF_EXITING`），若是则转 `do_exit(-E_KILLED)`。
+
+**（4）`do_yield` 与 `do_kill`：把"让出"和"终止"交给 Trap 返回路径。** `do_yield` 只做一件事：置 `current->need_resched = 1` 并返回 0。真正的切换发生在 `trap()` 返回用户态之前——它检查 `need_resched` 后调用 `schedule()`。这样用户态的 `yield()` 语义与内核里的让出保持同一处实现。[Trap 返回调度](../code/kern/trap/trap.c)
+
+`do_kill` 不改动目标进程的现场，只置 `PF_EXITING`：目标若在睡眠（例如阻塞在 `do_wait` 上）则顺带唤醒，使其能走到检查点；目标若正在用户态运行，会在下一次陷入内核（系统调用、异常或时钟中断）返回用户态之前被 `trap()` 拦下并转 `do_exit(-E_KILLED)`。因此"被杀进程不会带着半更新状态继续执行用户代码"，退出路径也只有 `do_exit` 一条。接口返回值为：找不到进程（含负 pid）返回 `-E_INVAL`，已经在退出或已是僵尸返回 `-E_KILLED`，成功置位返回 0。
+
+**（5）联调阶段补上的两处配合。** 单模块测试通过后，`spin` 与 `forktest` 暴露了两个跨模块问题，都属于"生命周期控制所依赖的前提"，一并修正。
+
+| 问题 | 现象 | 修正 |
+| --- | --- | --- |
+| 用户态进程不可抢占 | `user/spin.c` 的子进程在 U 态 `while(1);` 之后不再陷入内核，父进程拿不到 CPU 去 `kill`，测试停在第 100 个 tick 的关机点 | 时钟中断处理里置 `current->need_resched = 1`，复用 `trap()` 返回用户态前的调度点，实现时间片轮转 |
+| 僵尸回收后的空闲页判据过严 | `forktest` 连续 32 次 fork/exit 后，`init_main` 比较空闲页数不相等，打印的是差异行而不是 `init check memory pass.` | 进程数量、进程链表、页表引用等账本断言保持不变；空闲页差异作为记录打印（SLOB 分配器不归还清空的 arena 页，稳定差 2 页），账本结论照常输出 |
+
 #### 4.4.4 Spec 与 Prompt
 
+本节（4.4）的验收依据是"进程状态与资源的守恒"：退出后页表引用归零、进程计数回到 2、父进程能取到退出码；等待既不漏收也不误收；被终止的进程一定经 `do_exit` 退出。[功能模块五开发提示词](prompt.md#lab5-process-lifecycle)
+
+| 提示词部分 | 设计要求与实现对应 |
+| --- | --- |
+| `[PROMPT]` | 只补齐 `dup_mmap`、`do_exit`、`do_wait`、`do_yield`、`do_kill` 五个函数，保留 Lab4 的调度、上下文切换与进程链表机制，不实现 COW Challenge，不重构既有接口 |
+| `[RELY]` | 依据 `copy_range` 的区间复制约定、`mm_count` 的引用语义、`exit_mmap/put_pgdir/mm_destroy` 的清理顺序、`WT_CHILD`/`PF_EXITING` 与 `trap()` 的配合关系实现 |
+| `[GUARANTEE]` | 普通 fork 复制独立物理页；退出先切 `satp` 再减引用，计数归零才拆页表；等待按 pid 过滤后再决定睡眠或报错；`kill` 只置标志，由 `trap()` 收口 |
+| `[SPECIFICATION]` | 分别检查普通 fork 的独立性、退出时的资源守恒、等待的三种语义、终止的两种目标状态（睡眠/运行）以及 `kill` 自身的错误分支 |
+
+**Pre-Condition：** Lab4 的进程创建、调度与上下文切换可用；`copy_range` 已能按区间复制用户页；`syscall` 已把 `SYS_exit`/`SYS_wait`/`SYS_yield`/`SYS_kill` 分发到本模块；`trap()` 已具备返回用户态前的 `PF_EXITING` 与 `need_resched` 检查点。
+
+**Post-Condition：** `fork` 后父子用户页互相独立，子进程可从同一用户 PC 继续执行；进程退出后其用户页表、内核栈与 PCB 全部被回收，父进程取得退出码，进程计数回到 2；等待指定 pid 时若子进程未退出则阻塞、若不存在则返回 `-E_BAD_PROC`；被 `kill` 的进程一定经 `do_exit` 结束。
+
+**Cases：** 普通 fork 后父子写同一变量互不影响；`CLONE_VM` 只增引用不复制页；子进程先退出与父进程先等待两种时序；僵尸回收后再次 `waitpid` 与 `wait()` 均应失败；`kill` 一个 U 态忙等进程、一个睡眠进程、一个已退出进程与一个不存在的 pid；32 个并发子进程全部回收后页表与进程账本保持一致。
+
 #### 4.4.5 实现及验证过程
+
+**（1）内核自检先过关。** 引导期内存管理自检与三项内核用例全部通过后，才进入用户程序阶段。这一阶段同时确认 `dup_mmap` 没有被误调用（`idleproc`/`initproc` 的 `mm` 为空），以及 `do_wait(-1, NULL)`、`do_kill(-1)`、`do_yield()` 三个边界返回值符合规格。
+
+```text
+check_alloc_page() succeeded!   check_pgdir() succeeded!   check_boot_pgdir() succeeded!
+check_vma_struct() succeeded!   check_vmm() succeeded.
+[Test Process Create] PASS      [Test Syscall] PASS        [Test Process Control] PASS
+```
+
+**（2）fork + exit 的联合验证。** `exit` 测试先制造父子进程，子进程连续 `yield` 后以固定退出码退出，父进程在 `waitpid` 上阻塞、被唤醒后校验退出码。串口输出同时验证了复制、调度、等待与回收四件事。
+
+```text
+kernel_execve: pid = 2, name = "exit".
+I am the parent. Forking the child...
+I am parent, fork a child pid 3
+I am the parent, waiting now..
+I am the child.
+waitpid 3 ok.
+exit pass.
+all user-mode processes have quit.
+init check memory pass.
+```
+
+其中 `waitpid 3 ok.` 依赖"父子各自一份 Trap 帧与用户页"（地址空间复制）与"僵尸唤醒 + 回收"（退出与等待）；`init check memory pass.` 说明 `exit_mmap`、`put_pgdir`、`mm_destroy` 与四次 `kfree` 的路径没有遗留页。
+
+**（3）终止一个 U 态忙等进程。** `spin` 测试中，子进程进入 `while(1);` 后不再发起系统调用。父进程三次 `yield` 后调用 `kill`，子进程在下一次时钟中断返回用户态前被转交 `do_exit(-E_KILLED)`，父进程随后 `waitpid` 成功。
+
+```text
+I am the child. spinning ...
+I am the parent.  Killing the child...
+kill returns 0
+wait returns 0
+spin may pass.
+```
+
+**（4）并发退出的回收边界。** `forktest` 连续 fork 出 32 个子进程，每个子进程打印序号后 `exit(0)`，父进程再逐个 `wait()`。这一用例把"多个子进程在父进程尚未被调度时先后进入僵尸态"的时序压到一起：第一个子进程退出后父进程已被唤醒但仍未运行（`state == PROC_RUNNABLE`），第二个子进程退出时若再调用一次 `wakeup_proc`，就会命中"不能唤醒 RUNNABLE 进程"的断言；同样地，父进程被唤醒后若不重置 `wait_state`，下一次进入等待时会被误判为仍在等待。实测 32 个子进程全部回收，进程链表中只剩 `initproc`。
+
+```text
+I am child 31
+...
+I am child 0
+forktest pass.
+all user-mode processes have quit.
+init: free pages before 31583, after 31581.
+init check memory pass.
+```
+
+空闲页差 2 页来自 kmalloc 的 SLOB arena：它把清空的页留在堆内而不归还页分配器，因此进程账本正确但页数不会完全复原。做法见 4.4.3 第（5）节：页数差异作为记录输出，账本断言照旧。
+
+**（5）边界与错误分支。**
+
+| 用例 | 预期 | 实测 |
+| --- | --- | --- |
+| 回收后再次 `waitpid(pid, ...)` | 失败（`-E_BAD_PROC`） | `assert(waitpid(pid, &code) != 0 && wait() != 0)` 通过 |
+| 无子进程时 `wait()` | 失败（`-E_BAD_PROC`） | `init_main` 的等待循环以 `-E_BAD_PROC` 退出，`nr_process == 2`、`proc_list` 只剩 `initproc` |
+| `do_wait(-1, NULL)` | `-E_BAD_PROC` | 内核用例 `[Test Process Control] PASS` |
+| `do_kill(-1)` | `-E_INVAL` | 同上 |
+| `kill` 一个已退出的子进程 | `-E_KILLED` | 通过 `PF_EXITING`/`PROC_ZOMBIE` 分支返回，不触发二次 `wakeup_proc` |
 
 ## 五、测试与验证
 
@@ -277,19 +460,114 @@ U parent pid=2, fork result=3, shared write=3
 
 ```bash
 cd code
-make -j4
-make grade
+make -j4          # 交叉编译内核与全部用户程序，生成 bin/ucore.img
+make grade        # 全量评分：clean → 复制到临时目录 → 注入内核用例 → 跑 13 个用户程序
 ```
 
-**（2）测试结果。**
+`make grade` 的每个用例分两部分计分：结果检查（7 分）核对用户程序的关键输出，输出检查（3 分）核对内核自检行。单独观察某个程序时可执行 `make run-hello`、`make run-exit`、`make run-spin`、`make run-forktest`、`make run-divzero` 等目标，串口直接输出到终端。
+
+**（2）测试结果。** 13 个用例的 `-check result` 与 `-check output` 两项均为 OK，汇总如下：
+
+```text
+badsegment  OK   divzero  OK   softint  OK   faultread  OK   faultreadkernel  OK
+hello       OK   testbss  OK   pgdir    OK   yield      OK   badarg           OK
+exit        OK   spin     OK   forktest OK
+Total Score: 130/130
+```
+
+| 用例 | 覆盖的模块 | 关键判据 |
+| --- | --- | --- |
+| badsegment / divzero / softint | 首个用户进程 + 异常入口 | 非法段、除零、非法指令下进程能进入并退出 |
+| faultread / faultreadkernel | 用户地址检查 | 不得出现 `user panic at` |
+| hello / testbss / pgdir | 装载器 + 系统调用 | 用户程序在 U 态执行并打印 |
+| yield | 调度 + `do_yield` | 五次让出后原进程继续执行 |
+| badarg | fork + 用户指针校验 | `fork ok.`、`badarg pass.` |
+| exit | fork + wait + exit | `waitpid ... ok.`、退出码校验、内存全部回收 |
+| spin | kill + 抢占 + wait | `kill returns 0`、`wait returns 0` |
+| forktest | 32 次 fork/exit | 全部子进程回收，进程链表中只剩 `initproc` |
+
+内核用例（`tools/test_lab5.c`）在任何用户程序运行之前执行，用于确认 PCB、系统调用与进程控制的接口约定：
+
+```text
+[Test Process Create] PASS
+[Test Syscall] PASS
+[Test Process Control] PASS
+```
 
 **（3）串口关键输出。**
 
-**（4）GDB 验证。** 
+```text
+check_vma_struct() succeeded!
+check_vmm() succeeded.
+[Test Process Create] PASS
+++ setup timer interrupts
+[Test Syscall] PASS
+[Test Process Control] PASS
+kernel_execve: pid = 2, name = "hello".
+Hello world!!
+I am process 2.
+hello pass.
+all user-mode processes have quit.
+init check memory pass.
+```
+
+`exit` 用例的父子进程与退出码校验（4.4 模块的完整链路）：
+
+```text
+I am the parent. Forking the child...
+I am parent, fork a child pid 3
+I am the parent, waiting now..
+I am the child.
+waitpid 3 ok.
+exit pass.
+```
+
+`spin` 用例的终止路径：
+
+```text
+I am the child. spinning ...
+I am the parent.  Killing the child...
+kill returns 0
+wait returns 0
+spin may pass.
+```
+
+`forktest` 用例的并发回收（节选）：
+
+```text
+I am child 31
+...
+I am child 0
+forktest pass.
+all user-mode processes have quit.
+init: free pages before 31583, after 31581.
+init check memory pass.
+```
+
+**（4）GDB 验证。** 分支任务按指导书要求使用双重 GDB：ucore 侧在 `user/libs/syscall.c` 的内联汇编处下断点，单步到 `ecall` 前；QEMU 侧在 `ecall` 处理完成后移除原断点，并在 `sret` 前再次停住，观察模拟器如何完成特权级切换与地址翻译。
+
+```bash
+# 终端 1：启动带调试桩的 QEMU
+cd code && make debug
+# 终端 2：ucore 侧
+make gdb
+(gdb) add-symbol-file obj/__user_exit.out
+(gdb) b user/libs/syscall.c:18
+(gdb) c
+(gdb) si            # 单步到 ecall
+# 终端 1 显示 Continuing 时按 Ctrl-C，为 QEMU 侧下断点后继续
+```
+
+该分支任务的完整调试记录见 4.1.5（模块一，由张晨旭负责）。本模块关注的是返回侧的观察点：`sret` 之后用户程序第一条指令的地址应等于 `tf->epc`，且此时 `sstatus.SPP` 已为 0；`kill` 生效则表现为同一次陷出路径上 `do_exit(-E_KILLED)` 被调用。
 
 **（5）回归与未覆盖项。**
 
-**测试截图：**
+- COW Challenge 未实现：本实验只要求普通 fork 的独立页复制，`copy_range` 的共享分支保持未启用，`do_exit`/`do_wait` 的资源回收按独占页设计。
+- 空闲页回收存在固定差异：SLOB 分配器不归还清空的 arena 页，`forktest` 之后稳定差 2 页。进程账本（数量、链表、页表引用）全部正确，页数差异按记录输出。
+- 未覆盖：多核（PMP/IPI 并发）、文件系统与 swap 相关路径；本实验的用户程序均从内核镜像内嵌加载，未涉及磁盘。
+- 回归项：Lab1–Lab4 的物理内存管理、Sv39 启动映射、Trap 现场保存恢复在 `check_alloc_page()`、`check_pgdir()`、`check_boot_pgdir()`、`check_vma_struct()`、`check_vmm()` 中逐项确认未被破坏。
+
+**测试截图：** 本轮以 `make grade` 输出与串口日志作为证据，未另附截图。
 
 ---
 
@@ -297,6 +575,26 @@ make grade
 
 ### 对操作系统的理解
 
+**（1）进程是"地址空间 + 执行现场 + 内核资源"三件套。** 本实验中，`fork` 的本质是把这三件东西按不同策略处理：地址空间要么共享（只增 `mm_count`），要么逐 VMA 复制并用 `copy_range` 换页；执行现场靠复制一份 Trap 帧并把返回值改写成 0 来实现"一次调用返回两次"；内核资源（PCB、内核栈、PID、进程链表节点）则必须全新分配。把这三者分开看之后，"哪些必须复制、哪些可以共享、哪些必须重新申请"就不再需要靠记忆，而是由各自的语义推出来。
+
+**（2）资源回收的难点不是"怎么释放"，而是"谁有权释放"。** 进程退出时最反直觉的一点是：它不能释放自己的内核栈和 PCB，因为退出逻辑本身还跑在这两样东西上。于是 `do_exit` 只做自己有权做的部分（解除用户映射、置僵尸、唤醒父进程），把最后的回收交给 `do_wait`；如果父进程已经不在，就由 `do_exit` 把子进程改挂 `initproc`，让 `initproc` 扮演收割者。这条"所有权链"一旦理顺，僵尸进程、孤儿进程、重复唤醒这些问题都会各自落到明确的检查点上。
+
+**（3）一致性来自引用计数与"先切后用"的顺序。** `mm_count` 决定页表能不能拆，`nr_process` 决定进程链表和计数是否对得上，`satp` 决定"当前正在用哪张页表"。本模块最容易出错的两处都在顺序上：释放页表前必须先切 `satp`，减引用必须在确认没有兄弟共享之后。把这类约束写成不变量（"任一时刻 satp 指向的页表页码不小于 1 个引用"）比反复读代码更可靠。
+
+**（4）用户态与内核态的边界应当是唯一的收口点。** `kill` 的实现刻意不在系统调用里直接销毁目标进程，而是只置 `PF_EXITING`，让目标在自己下一次从内核返回用户态之前被 `trap()` 拦下。这样"进程不会带着半更新状态继续执行用户代码"这条性质由 Trap 返回路径统一保证，而不是在每个可能被杀的位置各写一遍清理逻辑。同理，`yield` 也只是置 `need_resched`，让调度点在同一个地方。把状态改变集中到少数入口，是这类系统代码最容易获得正确性的方式。
+
+**（5）并发时序要专门设计用例压。** 单个子进程退出时，"父进程是否已睡在 `WT_CHILD` 上"只有两种情况；32 个子进程连续退出时，父进程可能已经被前一个子进程唤醒但仍未运行，此时再调用 `wakeup_proc` 就会命中"不能唤醒 RUNNABLE 进程"的断言。`forktest` 这类数量型用例的价值就在这里：它把只有在特定交错下才会出现的状态组合稳定地压出来。
+
 ### AI 协作开发的经验
+
+**（1）先定 Spec，再让 AI 写实现。** 本模块的每个函数都先写清 Pre-Condition / Post-Condition / Cases，再交给 AI 生成代码。Spec 里最有价值的是"不允许做什么"——例如"`dup_mmap` 失败不自行清理"、"`kill` 不在系统调用里直接销毁进程"。这些约束能挡住 AI 最典型的行为：看到能回收的资源就顺手回收，看到能立刻完成的事情就立刻完成，结果破坏了调用者的回滚路径。
+
+**（2）让 AI 先读代码，再写代码。** 生成 `dup_mmap` 和 `do_wait` 之前，先让 AI 确认了 `copy_range` 的真实签名、`mm_map` 的重叠检查方式、`set_links`/`remove_links` 对 `nr_process` 的影响、`wakeup_proc` 的断言条件。这一步避免了几类常见的"看起来对"的错误：按旧版 ucore 的接口臆造函数名、假设 `mm_count` 从 0 开始、假设 `wait_state` 在唤醒后会被自动清除。
+
+**（3）把"能编译"和"能跑通"分成两个里程碑。** 第一个里程碑是内核自检三项全过，第二个才是用户程序用例全过。中间那道分界线非常有用：自检过不了说明问题在内存管理或接口约定；自检过了而用例不过，问题就落在进程生命周期本身。这道分界线把调试空间从"整个系统"压缩到"一个模块的语义"。
+
+**（4）先做对照实验，再动代码。** 联调时 `forktest` 在第二个子进程退出时崩溃，第一反应是"地址空间复制有问题"，真正的原因却在一条不起眼的断言上：`wakeup_proc()` 不允许唤醒已经处于 `PROC_RUNNABLE` 的进程。定位办法不是继续读代码，而是把崩溃前后的状态打出来（父进程当时是 `RUNNABLE` 还是 `SLEEPING`），再把这个状态与 `do_wait` 的唤醒路径对上。此后凡是遇到"只在特定数量或特定时序下才出现"的问题，都先构造更小的对照用例，把变量收敛到一个，再改代码；直接改实现往往会同时动到多条正确路径，反而看不出是哪一处起的作用。
+
+**（5）用串口日志建立证据链。** 每通过一个用例就把关键串口输出留存下来，既是报告的证据，也是回归时的对照基线。后面修改 `do_exit` 的唤醒条件时，正是靠 `forktest` 前后的日志对比，才确认改动只影响了重复唤醒、没有影响回收顺序。
 
 ---

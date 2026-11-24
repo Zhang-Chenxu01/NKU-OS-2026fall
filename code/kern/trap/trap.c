@@ -111,6 +111,13 @@ void interrupt_handler(struct trapframe *tf) {
         case IRQ_S_TIMER:
             clock_set_next_event();
             ticks++;
+            // A user process can spin without ever entering the kernel again
+            // (user/spin.c does exactly that), so the tick is the only place
+            // that can preempt it: trap() reschedules on the way back to user
+            // mode when need_resched is set.
+            if (current != NULL) {
+                current->need_resched = 1;
+            }
             if (ticks % TICK_NUM == 0) {
                 print_ticks();
                 if (ticks / TICK_NUM >= SHUTDOWN_AFTER) {

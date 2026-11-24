@@ -313,10 +313,37 @@ out:
     return ret;
 }
 
-//lab5 function3 YOUR CODE
+//lab5 function3 2413042
+// dup_mmap - duplicate every VMA of "from" into "to", pages included
 int dup_mmap(struct mm_struct *to, struct mm_struct *from)
 {
-    return -E_UNIMP; // Integration stub: Lab5 must implement address-space copying.
+    assert(to != NULL && from != NULL);
+
+    list_entry_t *list = &(from->mmap_list), *le = list;
+    while ((le = list_next(le)) != list)
+    {
+        struct vma_struct *vma = le2vma(le, list_link);
+
+        // 1. The child gets its own VMA with the same range and permissions.
+        int ret = mm_map(to, vma->vm_start, vma->vm_end - vma->vm_start, vma->vm_flags, NULL);
+        if (ret != 0)
+        {
+            return ret;
+        }
+
+        // 2. Copy the pages that are really present. Holes inside a VMA (for
+        //    example the guard page of the user stack) stay unmapped in the
+        //    child as well, so no page is fabricated here.
+        if (vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))
+        {
+            ret = copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, 0);
+            if (ret != 0)
+            {
+                return ret;
+            }
+        }
+    }
+    return 0;
 }
 
 
