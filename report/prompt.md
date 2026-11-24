@@ -431,6 +431,8 @@ static int sys_pgdir(uint64_t arg[]);
 
 # 功能模块二——用户进程创建与 ELF 程序装载
 
+<a id="lab5-user-elf"></a>
+
 `````
 [PROMPT]
 
@@ -585,6 +587,8 @@ static int sys_pgdir(uint64_t arg[]);
 `````
 
 # 功能模块三——用户进程 fork 与地址空间复制
+
+<a id="lab5-fork-mm"></a>
 
 `````
 [PROMPT]
@@ -987,4 +991,194 @@ int copy_range(pde_t *to, pde_t *from,
 所有报告内容必须以真实源码和实际测试为依据。
 
 **最终要求**：直接完成 `copy_range()` 的代码实现、必要测试及交付文档。完成后简要汇报实现状态、修改范围、测试结果以及需要其他成员配合的事项。全程禁止 Git 写操作。
+`````
+
+# 功能模块五——地址空间复制与进程生命周期
+
+<a id="lab5-process-lifecycle"></a>
+
+`````
+[PROMPT]
+
+**任务：完成南开大学 2026 uCore Lab5 的地址空间复制与进程生命周期功能，实现普通 fork 所需的 VMA 与页面复制，以及进程退出、等待、让出与终止的完整处理链。**
+
+当前分支：`lab5`。本次直接在已合并的 Lab5 代码上开发，不重新搭建工程，不覆盖已有实现。
+
+**主要修改文件：**
+
+- `code/kern/mm/vmm.c`：`dup_mmap`
+- `code/kern/process/proc.c`：`do_exit`、`do_wait`、`do_yield`、`do_kill`
+
+**需要实现或完善的函数：**
+
+- `int dup_mmap(struct mm_struct *to, struct mm_struct *from)`
+- `int do_exit(int error_code)`
+- `int do_wait(int pid, int *code_store)`
+- `int do_yield(void)`
+- `int do_kill(int pid)`
+
+**操作限制：**
+
+1. 必须直接修改实际源码完成实现，不接受只给方案或代码片段。
+2. 不修改 `copy_range`（成员 A）、`do_fork`/`copy_mm`/`copy_thread`/`load_icode`/`do_execve`（成员 B）、`syscall.c`/`trap.c`/`trapentry.S`（成员 A）。
+3. 保留 Lab4 已完成的调度、上下文切换、PID 管理与进程链表机制。
+4. 不实现 COW Challenge，普通 fork 使用独立物理页。
+5. 不修改现有测试程序、评分脚本与实验报告。
+6. **Git 仅允许只读操作**，例如 `git status`、`git diff`、`git log`、`git show`。禁止执行 `git add`、`git commit`、`git push`、`git pull`、`git fetch`、`git checkout`、`git reset`、`git stash` 及其他写操作。
+7. 联调阶段若确实需要其他文件的极小配合（例如让用户态进程可被时钟中断抢占、调整僵尸回收的打印口径），必须先记录现象与理由，改动限于必要语句，并在汇报中单独列出，不擅自重构他人模块。
+8. 失败路径必须如实返回错误码，不得用假成功、临时桩或吞掉错误的方式绕过未实现的依赖。
+
+**输出要求：**
+
+完成后汇报：各函数的完成状态与代码位置、关键设计选择、失败与边界情形的处理、实际执行的编译与测试命令及结果、仍需其他成员配合的事项。所有结论必须来自真实执行，不编造测试通过情况。
+
+[RELY]
+
+实现前认真阅读并核对以下文件：
+
+**虚拟内存与物理内存：**
+
+- `kern/mm/vmm.c`
+- `kern/mm/vmm.h`
+- `kern/mm/pmm.c`
+- `kern/mm/pmm.h`
+- `kern/mm/memlayout.h`
+
+**进程与调度：**
+
+- `kern/process/proc.c`
+- `kern/process/proc.h`
+- `kern/process/entry.S`
+- `kern/schedule/sched.c`
+
+**Trap 与系统调用：**
+
+- `kern/trap/trap.c`
+- `kern/trap/trapentry.S`
+- `kern/syscall/syscall.c`
+
+**用户态测试：**
+
+- `user/exit.c`
+- `user/forktest.c`
+- `user/spin.c`
+- `user/badarg.c`
+- `user/yield.c`
+
+重点确认以下约定，所有实现以工程中的实际代码为准：
+
+1. `copy_range` 的真实签名、区间对齐要求、未映射页面的处理方式与失败返回约定。
+2. `mm_map` 的重叠检查，以及 `vm_flags`（`VM_READ`/`VM_WRITE`/`VM_EXEC`/`VM_STACK`）与页权限的对应关系。
+3. `mm_count`、`mm_count_inc`、`mm_count_dec` 的语义，以及 `exit_mmap` 对 `mm_count == 0` 的断言。
+4. `destroy_unreferenced_mm`（`exit_mmap` + `put_pgdir` + `mm_destroy`）的调用前提与清理顺序。
+5. `proc_struct` 中 `parent`、`cptr`/`yptr`/`optr`、`wait_state`、`exit_code`、`flags` 的含义，以及 `set_links`/`remove_links` 对 `nr_process` 的维护。
+6. `wakeup_proc` 的断言条件：不能唤醒 `PROC_ZOMBIE` 或 `PROC_RUNNABLE` 的进程。
+7. `trap()` 在返回用户态之前的 `PF_EXITING` 与 `need_resched` 检查点，以及 `kernel_thread_entry` 在函数返回后调用 `do_exit` 的行为。
+8. `satp` 的编码方式，`boot_pgdir_pa` 的含义，以及切换地址空间时 `flush_tlb` 的必要性。
+
+[GUARANTEE]
+
+### 1. 完善 dup_mmap
+
+复制父进程的整个用户地址空间，保证普通 fork 后父子进程的可写用户页互相独立：
+
+- 遍历 `from->mmap_list` 中的每个 VMA，为子进程建立范围相同、权限相同的 VMA。
+- 对带 `VM_READ`/`VM_WRITE`/`VM_EXEC` 的区间调用 `copy_range` 复制实际存在的页。
+- 区间内未建立映射的空洞（例如用户栈最低一页的保护页）在子进程中保持未映射，不得凭空分配页面。
+- 不改动父进程的 VMA 与页表。
+- 失败时只返回错误码，不自行销毁 `to`；由调用方（`copy_mm`）统一回收本次分配的私有地址空间，避免双重释放。
+- 不实现 COW，`copy_range` 的共享分支不在本函数中启用。
+
+### 2. 完善 do_exit
+
+释放进程资源并把自己交给父进程收割：
+
+- `idleproc` 不得退出；`initproc` 允许退出（`init_main` 回收完所有用户进程后返回，`kernel_thread_entry` 会把这次返回接到 `do_exit` 上）。
+- 进程持有 `mm` 时，必须先把 `satp` 切到启动页表并刷新 TLB，再减少该 `mm` 的引用计数；只有计数归零才执行 `exit_mmap`、`put_pgdir`、`mm_destroy`。
+- 在关中断区内把状态置为 `PROC_ZOMBIE`、记录 `exit_code`。
+- 仅当父进程确实睡在 `WT_CHILD` 上时才唤醒它，避免对 `RUNNABLE` 进程重复调用 `wakeup_proc`。
+- 把自己的子进程改挂到 `initproc` 名下并维护 `cptr`/`yptr`/`optr` 链；其中已是僵尸的子进程需要唤醒同样处于睡眠的 `initproc`。
+- 最后调用 `schedule()` 交出 CPU，函数不得返回；末尾以 `panic` 兜底。
+
+### 3. 完善 do_wait
+
+等待指定或任意子进程退出，并回收僵尸资源：
+
+- `pid == 0` 等待任意子进程，`pid > 0` 等待指定子进程；先按 `pid` 过滤，再统计是否存在匹配的子进程。
+- 不存在匹配的子进程（含 `pid < 0`、指定 pid 不存在、已无任何子进程）时返回 `-E_BAD_PROC`，不得睡眠。
+- 匹配的子进程处于 `PROC_ZOMBIE` 时：取出退出码、`unhash_proc`、`remove_links`、`put_kstack`、`kfree`，返回 0。
+- 匹配的子进程尚未退出时：置 `PROC_SLEEPING` 与 `WT_CHILD` 后调用 `schedule()`；被唤醒后清空 `wait_state` 重新扫描，并检查自身是否已被终止（`PF_EXITING`），若是则转 `do_exit(-E_KILLED)`。
+- 不重复回收同一进程，不误唤醒未被等待的进程。
+
+### 4. 完善 do_yield 与 do_kill
+
+- `do_yield`：置 `current->need_resched = 1` 并返回 0，真正的切换交给 `trap()` 返回用户态前的调度点。
+- `do_kill`：找不到进程返回 `-E_INVAL`；目标已在退出或已是僵尸返回 `-E_KILLED`；否则置 `PF_EXITING`（若目标在睡眠则唤醒），返回 0。
+- `do_kill` 不在系统调用路径上直接销毁目标进程，被终止的进程必须经 `trap()` 转到 `do_exit(-E_KILLED)` 退出，保证"不会带着半更新状态继续执行用户代码"。
+
+### 5. 跨模块配合
+
+本模块依赖两处调度/回收前提，若基线缺失需要一并确认，并在汇报中单独说明：
+
+- 用户态进程必须可被时钟中断抢占（`need_resched`），否则 U 态忙等进程永远不会被换下，`kill` 与 `wait` 无法验证。
+- 僵尸回收后的空闲页判据：SLOB 分配器不归还清空的 arena 页，进程数量/链表/页表引用等账本断言优先，页数差异应作为记录输出而不是判定失败。
+
+[SPECIFICATION]
+
+### Pre-Condition
+
+- Lab4 的进程创建、调度与上下文切换可用；`copy_range`、`do_fork`、`copy_mm`、`copy_thread` 已实现。
+- `syscall` 已把 `SYS_exit`、`SYS_wait`、`SYS_yield`、`SYS_kill` 分发到本模块。
+- `trap()` 已具备返回用户态前的 `PF_EXITING` 与 `need_resched` 检查点；`kernel_thread_entry` 在目标函数返回后调用 `do_exit`。
+
+### Post-Condition
+
+- 普通 fork 后父子进程的可写用户页互相独立，子进程可从同一条用户指令之后继续执行。
+- 进程退出后其用户页表、内核栈与 PCB 全部被回收，父进程取得退出码，`nr_process` 回到 2，`proc_list` 只剩 `initproc`。
+- 等待指定 pid 时，子进程未退出则阻塞、不存在则返回 `-E_BAD_PROC`；回收后再次等待必然失败。
+- 被 `kill` 的进程一定经 `do_exit` 结束。
+
+### Case 1：普通 fork 的地址空间独立性
+
+父子进程分别写入同一全局变量，父进程侧的修改不得被子进程看到，反之亦然；栈保护页在子进程中保持未映射。
+
+### Case 2：等待语义
+
+分别验证 `pid == 0`、`pid > 0` 且子进程未退出、`pid > 0` 且子进程已退出并回收、`pid < 0`、指定 pid 不存在五种情形。
+
+### Case 3：终止
+
+分别终止一个 U 态忙等进程、一个阻塞在 `do_wait` 上的进程、一个已退出进程与一个不存在的 pid，检查返回值与最终状态。
+
+### Case 4：僵尸回收与计数
+
+回收后检查 `unhash_proc`/`remove_links` 的效果：`nr_process` 回到 2、`proc_list` 只剩 `initproc`、内核栈与 PCB 均被释放。
+
+### Case 5：孤儿收养
+
+父进程先退出时，其子进程被改挂到 `initproc`，随后由 `initproc` 回收，不得出现无人管理的进程树分支。
+
+### Case 6：失败与边界
+
+`dup_mmap` 失败时由 `copy_mm` 回收半成品；`do_exit` 对 `idleproc` 拒绝退出；`do_wait` 的非法参数立即返回错误而不是永久睡眠。
+
+### 测试要求
+
+1. 完成源码修改后执行编译与链接检查。
+2. 内核用例 `[Test Process Create]`、`[Test Syscall]`、`[Test Process Control]` 必须通过。
+3. 覆盖 `exit`、`spin`、`forktest`、`badarg`、`yield` 等用户程序。
+4. 执行 `make grade` 全量评分，并如实记录各项结果。
+5. 使用 `git diff --check` 与 `git diff` 检查最终改动。
+6. 所有测试结论必须来自真实执行，不得伪造串口日志或评分输出。
+
+### 最终交付
+
+完成后请汇报：
+
+1. 修改了哪些函数及主要实现内容。
+2. `dup_mmap` 的两段式复制如何处理 VMA 与空洞页面。
+3. `do_exit` 的资源释放顺序及其原因。
+4. `do_wait` 的过滤、睡眠与回收逻辑。
+5. `do_yield`/`do_kill` 与 `trap()` 的配合方式。
+6. 实际执行的编译和测试命令及结果，以及需要其他成员配合的事项。
 `````
