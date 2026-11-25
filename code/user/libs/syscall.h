@@ -4,6 +4,7 @@
 int sys_exit(int64_t error_code);
 int sys_fork(void);
 int sys_wait(int64_t pid, int *store);
+int sys_exec(const char *name, size_t len, unsigned char *binary, size_t size);
 int sys_yield(void);
 int sys_kill(int64_t pid);
 int sys_getpid(void);

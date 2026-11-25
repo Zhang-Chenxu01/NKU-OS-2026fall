@@ -289,6 +289,10 @@ int do_exit(int error_code)
     // initproc is allowed to exit: init_main returns once every user process
     // has been reaped, and kernel_thread_entry funnels that return into
     // do_exit(). The kernel keeps running in idleproc afterwards.
+    if (current == initproc && current->cptr != NULL)
+    {
+        panic("initproc exit with children.\n");
+    }
 
     struct mm_struct *mm = current->mm;
     if (mm != NULL)
@@ -391,7 +395,7 @@ init_main(void *arg)
 }
 
 //LAB4 function2 2411566
-//lab5 function2 YOUR CODE update alloc_proc
+//lab5 function2 2411566 update alloc_proc
 // The existing memset also initializes the appended Lab5 fields.
 static struct proc_struct *alloc_proc(void)
 {
@@ -523,7 +527,7 @@ bad_proc:
     return ret;
 }
 
-//lab5 function2 YOUR CODE update kernel_thread
+//lab5 function2 2411566 update kernel_thread
 int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
 {
     struct trapframe tf;
@@ -1001,9 +1005,9 @@ int do_yield(void)
 int do_kill(int pid)
 {
     struct proc_struct *proc = find_proc(pid);
-    if (proc == NULL)
+    if (proc == NULL || proc == idleproc || proc == initproc)
     {
-        // Negative or unknown pid never names a live process.
+        // Keep the orphan reaper alive until init_main finishes its wait loop.
         return -E_INVAL;
     }
     if ((proc->flags & PF_EXITING) || proc->state == PROC_ZOMBIE)

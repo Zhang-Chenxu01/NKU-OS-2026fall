@@ -38,6 +38,11 @@ sys_wait(int64_t pid, int *store) {
 }
 
 int
+sys_exec(const char *name, size_t len, unsigned char *binary, size_t size) {
+    return syscall(SYS_exec, (uintptr_t)name, len, (uintptr_t)binary, size, 0);
+}
+
+int
 sys_yield(void) {
     return syscall(SYS_yield, 0, 0, 0, 0, 0);
 }

@@ -8,10 +8,7 @@
 #include <error.h>
 #include <vmm.h>
 
-/* The merged tree declares this service but does not yet define it. */
-extern void print_pgdir(void) __attribute__((weak));
-
-//lab5 function1 YOUR CODE
+//lab5 function1 2411326
 static bool syscall_user_access(uintptr_t addr, size_t len, bool write)
 {
     /* mm == NULL makes user_mem_check accept kernel addresses; user calls
@@ -80,10 +77,6 @@ static int sys_putc(uint64_t arg[])
 
 static int sys_pgdir(uint64_t arg[])
 {
-    if (print_pgdir == NULL)
-    {
-        return -E_UNIMP;
-    }
     print_pgdir();
     return 0;
 }
@@ -102,7 +95,7 @@ static int (*const syscalls[])(uint64_t arg[]) = {
 
 #define NUM_SYSCALLS        ((sizeof(syscalls)) / (sizeof(syscalls[0])))
 
-//lab5 function1 YOUR CODE
+//lab5 function1 2411326
 
 void syscall(void)
 {

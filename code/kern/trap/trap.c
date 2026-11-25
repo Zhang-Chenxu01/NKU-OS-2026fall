@@ -166,7 +166,7 @@ static size_t insn_length(uintptr_t epc) {
 //lab3 function2 2413042
 void exception_handler(struct trapframe *tf) {
     switch (tf->cause) {
-        //lab5 function1 YOUR CODE update exception_handler
+        //lab5 function1 2411566 update exception_handler
         case CAUSE_USER_ECALL:
             tf->epc += 4;
             syscall(); // ecall is always 4 bytes, including on RVC machines.
@@ -178,6 +178,18 @@ void exception_handler(struct trapframe *tf) {
         case CAUSE_ILLEGAL_INSTRUCTION:
             cprintf("Illegal instruction at 0x%lx\n", tf->epc);
             tf->epc += insn_length(tf->epc);
+            break;
+        case CAUSE_FETCH_PAGE_FAULT:
+        case CAUSE_LOAD_PAGE_FAULT:
+        case CAUSE_STORE_PAGE_FAULT:
+            // Lab5 eagerly maps user pages; no recoverable page-fault path
+            // exists yet. Do not retry an instruction that cannot complete.
+            print_trapframe(tf);
+            if (!trap_in_kernel(tf) && current != NULL) {
+                do_exit(-E_FAULT);
+            }
+            panic("unhandled kernel page fault at 0x%lx, address 0x%lx.\n",
+                  tf->epc, tf->badvaddr);
             break;
         default:
             print_trapframe(tf);
