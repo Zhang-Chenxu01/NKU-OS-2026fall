@@ -25,6 +25,11 @@ waitpid(int pid, int *store) {
     return sys_wait(pid, store);
 }
 
+int
+exec(const char *name, size_t len, unsigned char *binary, size_t size) {
+    return sys_exec(name, len, binary, size);
+}
+
 void
 yield(void) {
     sys_yield();

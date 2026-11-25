@@ -38,6 +38,44 @@ static void check_boot_pgdir(void);
 pde_t *boot_pgdir_va = NULL;
 uintptr_t boot_pgdir_pa;
 
+// Read-only Sv39 walk. R/W/X marks a leaf even at the 1 GiB/2 MiB levels.
+static void print_pgdir_level(pde_t *table, int level, uintptr_t base)
+{
+    uintptr_t span = (uintptr_t)PGSIZE << (9 * level);
+    for (size_t i = 0; i < NPTEENTRY; ++i)
+    {
+        pte_t entry = table[i];
+        if (!(entry & PTE_V))
+            continue;
+        uintptr_t va = base + i * span;
+        if (entry & (PTE_R | PTE_W | PTE_X))
+        {
+            // Sign-extend bit 38 for the upper half of the Sv39 address space.
+            uintptr_t canonical = va;
+            if (va & (1UL << 38))
+                canonical |= ~((1UL << 39) - 1);
+            cprintf("  L%d va 0x%016lx-0x%016lx -> pa 0x%016lx %c%c%c%c\n",
+                    level, canonical, canonical + span - 1, PTE_ADDR(entry),
+                    (entry & PTE_U) ? 'u' : 's',
+                    (entry & PTE_R) ? 'r' : '-',
+                    (entry & PTE_W) ? 'w' : '-',
+                    (entry & PTE_X) ? 'x' : '-');
+        }
+        else if (level > 0)
+        {
+            print_pgdir_level(KADDR(PDE_ADDR(entry)), level - 1, va);
+        }
+    }
+}
+
+void print_pgdir(void)
+{
+    // satp holds the running process's physical root, not always boot_pgdir.
+    uintptr_t root_pa = (read_csr(satp) & ((1UL << 44) - 1)) << PGSHIFT;
+    cprintf("Sv39 page table root=0x%016lx\n", root_pa);
+    print_pgdir_level(KADDR(root_pa), 2, 0);
+}
+
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
     pmm_manager = &default_pmm_manager;
@@ -517,7 +555,7 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 }
 
 
-//lab5 function3 YOUR CODE
+//lab5 function3 2411326
 /* Read-only lookup for copy_range: distinguish absent subtrees from the
  * large leaves that get_pte deliberately refuses to descend into. */
 static int copy_range_lookup(pde_t *pgdir, uintptr_t addr,
