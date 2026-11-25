@@ -409,6 +409,14 @@ static struct proc_struct *alloc_proc(void)
         proc->pgdir = boot_pgdir_pa;
         list_init(&(proc->list_link));
         list_init(&(proc->hash_link));
+        //lab6 function1-1 YOUR CODE update alloc_proc
+        // Lab6 integration: initialized; retain the exercise marker.
+        proc->rq = NULL;
+        list_init(&(proc->run_link));
+        proc->time_slice = 0;
+        skew_heap_init(&(proc->lab6_run_pool));
+        proc->lab6_stride = 0;
+        proc->lab6_priority = 1;
     }
     return proc;
 }
@@ -1024,4 +1032,14 @@ int do_kill(int pid)
         wakeup_proc(proc);
     }
     return 0;
+}
+
+// For lab6, set the process's priority (bigger value will get more CPU time)
+void lab6_set_priority(uint32_t priority)
+{
+    cprintf("set priority to %d\n", priority);
+    if (priority == 0)
+        current->lab6_priority = 1;
+    else
+        current->lab6_priority = priority;
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.17)
-project(lab5)
+project(lab6)
 
 set(CMAKE_CXX_STANDARD 14)
 
@@ -20,7 +20,7 @@ include_directories(tools)
 include_directories(user)
 include_directories(user/libs)
 
-add_executable(lab5
+add_executable(lab6
         boot/asm.h
         boot/bootasm.S
         boot/bootmain.c
@@ -66,6 +66,9 @@ add_executable(lab5
         kern/process/proc.h
         kern/schedule/sched.c
         kern/schedule/sched.h
+        kern/schedule/default_sched.h
+        kern/schedule/default_sched.c
+        kern/schedule/default_sched_stride.c
         kern/sync/sync.h
         kern/syscall/syscall.c
         kern/syscall/syscall.h
@@ -77,6 +80,7 @@ add_executable(lab5
         libs/error.h
         libs/hash.c
         libs/list.h
+        libs/skew_heap.h
         libs/printfmt.c
         libs/rand.c
         libs/riscv.h
@@ -105,6 +109,8 @@ add_executable(lab5
         user/forktest.c
         user/forktree.c
         user/hello.c
+        user/matrix.c
+        user/priority.c
         user/pgdir.c
         user/softint.c
         user/spin.c

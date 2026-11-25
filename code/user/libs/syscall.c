@@ -67,3 +67,13 @@ sys_pgdir(void) {
     return syscall(SYS_pgdir, 0, 0, 0, 0, 0);
 }
 
+int
+sys_gettime(void) {
+    return syscall(SYS_gettime, 0, 0, 0, 0, 0);
+}
+
+void
+sys_lab6_set_priority(uint64_t priority) {
+    syscall(SYS_lab6_set_priority, priority, 0, 0, 0, 0);
+}
+

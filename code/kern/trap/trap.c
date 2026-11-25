@@ -15,7 +15,6 @@
 #include <error.h>
 
 #define TICK_NUM 100
-#define SHUTDOWN_AFTER 3  // 2411566：累计输出三次时钟统计后请求关机。
 
 static void print_ticks() {
     cprintf("%d ticks\n", TICK_NUM);
@@ -109,20 +108,15 @@ void interrupt_handler(struct trapframe *tf) {
             cprintf("User timer interrupt\n");
             break;
         case IRQ_S_TIMER:
+            //lab6 function1-2 YOUR CODE update interrupt_handler
+            // Lab6 integration: dispatch ticks through the scheduling class.
             clock_set_next_event();
             ticks++;
-            // A user process can spin without ever entering the kernel again
-            // (user/spin.c does exactly that), so the tick is the only place
-            // that can preempt it: trap() reschedules on the way back to user
-            // mode when need_resched is set.
             if (current != NULL) {
-                current->need_resched = 1;
+                sched_class_proc_tick(current);
             }
             if (ticks % TICK_NUM == 0) {
                 print_ticks();
-                if (ticks / TICK_NUM >= SHUTDOWN_AFTER) {
-                    sbi_shutdown();
-                }
             }
             break;
         case IRQ_H_TIMER:

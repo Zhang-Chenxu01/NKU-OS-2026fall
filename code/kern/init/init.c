@@ -11,6 +11,7 @@
 #include <dtb.h>
 #include <vmm.h>
 #include <proc.h>
+#include <sched.h>
 
 int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
@@ -35,6 +36,7 @@ int kern_init(void) {
     idt_init();  // init interrupt descriptor table
 
     vmm_init();   // Lab4 virtual memory structures
+    sched_init(); // Must precede proc_init(), which wakes the first thread.
     proc_init();  // Lab4 process table (exercise placeholder)
 
     clock_init();   // init clock interrupt

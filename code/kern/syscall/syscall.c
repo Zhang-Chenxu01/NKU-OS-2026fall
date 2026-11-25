@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <error.h>
 #include <vmm.h>
+#include <clock.h>
 
 //lab5 function1 2411326
 static bool syscall_user_access(uintptr_t addr, size_t len, bool write)
@@ -81,6 +82,17 @@ static int sys_pgdir(uint64_t arg[])
     return 0;
 }
 
+static int sys_gettime(uint64_t arg[])
+{
+    return (int)(ticks * 10);
+}
+
+static int sys_lab6_set_priority(uint64_t arg[])
+{
+    lab6_set_priority((uint32_t)arg[0]);
+    return 0;
+}
+
 static int (*const syscalls[])(uint64_t arg[]) = {
     [SYS_exit]              sys_exit,
     [SYS_fork]              sys_fork,
@@ -91,6 +103,8 @@ static int (*const syscalls[])(uint64_t arg[]) = {
     [SYS_getpid]            sys_getpid,
     [SYS_putc]              sys_putc,
     [SYS_pgdir]             sys_pgdir,
+    [SYS_gettime]           sys_gettime,
+    [SYS_lab6_set_priority]  sys_lab6_set_priority,
 };
 
 #define NUM_SYSCALLS        ((sizeof(syscalls)) / (sizeof(syscalls[0])))

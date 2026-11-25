@@ -1,4 +1,4 @@
-PROJ	:= lab5
+PROJ	:= lab6
 EMPTY	:=
 SPACE	:= $(EMPTY) $(EMPTY)
 SLASH	:= /
@@ -246,7 +246,7 @@ run-nox-%: build-%
 build-%: touch
 	$(V)$(MAKE) $(MAKEOPTS) "DEFS+=-DTEST=$* -DTESTSTART=$(RUN_PREFIX)$*_out_start -DTESTSIZE=$(RUN_PREFIX)$*_out_size"
 
-.PHONY: grade touch
+.PHONY: grade grade-lab5 touch
 
 GRADE_GDB_IN	:= .gdb.in
 GRADE_QEMU_OUT	:= .qemu.out
@@ -256,16 +256,19 @@ TOUCH_FILES		:= kern/process/proc.c
 
 MAKEOPTS		:= --quiet --no-print-directory
 
-GRADE_TMP		:= /tmp/lab5_grade
+GRADE_TMP		:= /tmp/lab6_grade
+GRADE_INJECT	:= tools/inject_lab6.py
+GRADE_SCRIPT	:= tools/grade_lab6.sh
 
 grade:
-	$(V)$(MAKE) $(MAKEOPTS) clean
-	$(V)$(RM) -rf $(GRADE_TMP)
-	$(V)$(MKDIR) $(GRADE_TMP)
-	$(V)tar -C . --exclude=.git --exclude=.vscode --exclude=vcs -cf - . | tar -C $(GRADE_TMP) -xf -
-	$(V)python3 tools/inject.py $(GRADE_TMP)
-	$(V)cd $(GRADE_TMP) && $(SH) tools/grade.sh
-	$(V)$(RM) -rf $(GRADE_TMP)
+	$(V)set -e; grade_dir=$$(mktemp -d "$(GRADE_TMP).XXXXXX"); \
+		echo "Grading copy: $$grade_dir"; \
+		tar -C . --exclude=.git --exclude=.vscode --exclude=vcs --exclude=./obj --exclude=./bin -cf - . | tar -C "$$grade_dir" -xf -; \
+		python3 $(GRADE_INJECT) "$$grade_dir"; \
+		cd "$$grade_dir"; $(SH) $(GRADE_SCRIPT)
+
+grade-lab5:
+	$(V)$(MAKE) $(MAKEOPTS) grade GRADE_TMP=/tmp/lab5_grade GRADE_INJECT=tools/inject.py GRADE_SCRIPT=tools/grade.sh
 
 touch:
 	$(V)$(foreach f,$(TOUCH_FILES),$(TOUCH) $(f))
